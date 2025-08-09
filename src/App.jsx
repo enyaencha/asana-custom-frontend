@@ -1,5 +1,5 @@
 // App.jsx
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { AsanaProvider, useAsana } from './context/AsanaContext.jsx';
 import Dashboard from './components/Dashboard';
 import Navigation from './components/Navigation';
@@ -8,6 +8,11 @@ import TaskItem from './components/TaskItem';
 import Modal from './components/Modal';
 import ProjectForm from './components/ProjectForm';
 import TaskForm from './components/TaskForm';
+import ThemeManager from './components/ThemeManager';
+import AIInsightsDashboard from './components/AIInsightsDashboard';
+import NotificationCenter from './components/NotificationCenter';
+import SettingsPage from './components/SettingsPage';
+import { themeApi, notificationApi, activityApi } from './services/asanaApi';
 
 // Connection Status Component
 const ConnectionStatus = () => {
@@ -196,25 +201,78 @@ const ErrorScreen = () => {
 };
 
 // Main Dashboard App Component
+
 const DashboardApp = () => {
     const {
         user,
+        workspaces,
         projects,
         tasks,
         selectedProject,
+        selectedWorkspace,
         loading,
         error,
         serverStatus,
         loadProjectTasks,
         deleteProject,
-        deleteTask
+        deleteTask,
+        handleWorkspaceChange
     } = useAsana();
 
+    // Get the current workspace (selected or first one from workspaces array)
+    const currentWorkspace = selectedWorkspace || (workspaces && workspaces.length > 0 ? workspaces[0] : null);
+
+    // Enhanced State Management
     const [currentView, setCurrentView] = useState('dashboard');
     const [showProjectModal, setShowProjectModal] = useState(false);
     const [showTaskModal, setShowTaskModal] = useState(false);
     const [editingProject, setEditingProject] = useState(null);
     const [editingTask, setEditingTask] = useState(null);
+
+    // New Feature States
+    const [currentTheme, setCurrentTheme] = useState(null);
+    const [showNotifications, setShowNotifications] = useState(false);
+    const [notifications, setNotifications] = useState([]);
+    const [activityLog, setActivityLog] = useState([]);
+
+    // Load initial data and theme
+    useEffect(() => {
+        loadInitialData();
+        // Load saved theme from localStorage
+        const savedTheme = localStorage.getItem('asana-theme');
+        if (savedTheme) {
+            try {
+                setCurrentTheme(JSON.parse(savedTheme));
+            } catch (e) {
+                console.error('Error loading saved theme:', e);
+            }
+        }
+    }, []);
+
+    // Apply theme to document
+    useEffect(() => {
+        if (currentTheme) {
+            document.documentElement.style.setProperty('--primary-color', currentTheme.primary);
+            document.documentElement.style.setProperty('--secondary-color', currentTheme.secondary);
+            document.documentElement.style.setProperty('--background-color', currentTheme.background);
+            // Save theme to localStorage
+            localStorage.setItem('asana-theme', JSON.stringify(currentTheme));
+        }
+    }, [currentTheme]);
+
+    const loadInitialData = async () => {
+        try {
+            // Load notifications
+            const notifResponse = await notificationApi.getNotifications();
+            setNotifications(notifResponse.data || []);
+
+            // Load activity log
+            const activityResponse = await activityApi.getActivityLog(10);
+            setActivityLog(activityResponse.data || []);
+        } catch (error) {
+            console.error('Error loading initial data:', error);
+        }
+    };
 
     // Show connection status if not connected
     if (serverStatus !== 'connected') {
@@ -235,6 +293,18 @@ const DashboardApp = () => {
         setCurrentView(view);
     };
 
+    const handleThemeChange = (theme) => {
+        setCurrentTheme(theme);
+        // Show success notification
+        notificationApi.createNotification(
+            'Theme Changed',
+            `Successfully switched to ${theme.name} theme`,
+            'success'
+        ).then(() => {
+            loadInitialData(); // Reload notifications
+        });
+    };
+
     const handleCreateProject = () => {
         setEditingProject(null);
         setShowProjectModal(true);
@@ -251,6 +321,13 @@ const DashboardApp = () => {
             if (selectedProject?.gid === project.gid) {
                 setCurrentView('dashboard');
             }
+            // Add success notification
+            await notificationApi.createNotification(
+                'Project Deleted',
+                `Successfully deleted project "${project.name}"`,
+                'success'
+            );
+            loadInitialData();
         } catch (error) {
             alert(`Error deleting project: ${error.message}\n\nPlease check the server console for detailed logs.`);
         }
@@ -259,6 +336,7 @@ const DashboardApp = () => {
     const handleSaveProject = () => {
         setShowProjectModal(false);
         setEditingProject(null);
+        loadInitialData(); // Reload to show new activity
     };
 
     const handleCreateTask = () => {
@@ -278,6 +356,13 @@ const DashboardApp = () => {
     const handleDeleteTask = async (task) => {
         try {
             await deleteTask(task);
+            // Add success notification
+            await notificationApi.createNotification(
+                'Task Deleted',
+                `Successfully deleted task "${task.name}"`,
+                'success'
+            );
+            loadInitialData();
         } catch (error) {
             alert(`Error deleting task: ${error.message}\n\nPlease check the server console for detailed logs.`);
         }
@@ -286,11 +371,16 @@ const DashboardApp = () => {
     const handleSaveTask = () => {
         setShowTaskModal(false);
         setEditingTask(null);
+        loadInitialData(); // Reload to show new activity
     };
 
     const handleProjectClick = (project) => {
         loadProjectTasks(project);
         setCurrentView('tasks');
+    };
+
+    const getUnreadNotificationCount = () => {
+        return notifications.filter(n => !n.read).length;
     };
 
     const renderCurrentView = () => {
@@ -312,13 +402,29 @@ const DashboardApp = () => {
                             alignItems: 'center',
                             marginBottom: '2rem'
                         }}>
-                            <h2 style={{ margin: 0, fontSize: '2rem', fontWeight: '600' }}>
+                            <h2 style={{
+                                margin: 0,
+                                fontSize: '2rem',
+                                fontWeight: '600',
+                                display: 'flex',
+                                alignItems: 'center',
+                                gap: '0.5rem'
+                            }}>
                                 📁 All Projects ({projects.length})
+                                {selectedWorkspace && (
+                                    <span style={{
+                                        fontSize: '1.25rem',
+                                        fontWeight: '400',
+                                        color: '#718096'
+                                    }}>
+                                        in {selectedWorkspace.name}
+                                    </span>
+                                )}
                             </h2>
                             <button
                                 onClick={handleCreateProject}
                                 style={{
-                                    backgroundColor: '#ce3156',
+                                    backgroundColor: currentTheme?.primary || '#ce3156',
                                     color: 'white',
                                     border: 'none',
                                     padding: '0.75rem 1.5rem',
@@ -342,6 +448,7 @@ const DashboardApp = () => {
                                     onClick={handleProjectClick}
                                     onEdit={handleEditProject}
                                     onDelete={handleDeleteProject}
+                                    showWorkspace={!selectedWorkspace} // Show workspace info when viewing all workspaces
                                 />
                             ))}
                         </div>
@@ -364,7 +471,7 @@ const DashboardApp = () => {
                                 <button
                                     onClick={handleCreateTask}
                                     style={{
-                                        backgroundColor: '#48bb78',
+                                        backgroundColor: currentTheme?.secondary || '#48bb78',
                                         color: 'white',
                                         border: 'none',
                                         padding: '0.75rem 1.5rem',
@@ -398,7 +505,7 @@ const DashboardApp = () => {
                                         <button
                                             onClick={handleCreateTask}
                                             style={{
-                                                backgroundColor: '#48bb78',
+                                                backgroundColor: currentTheme?.secondary || '#48bb78',
                                                 color: 'white',
                                                 border: 'none',
                                                 padding: '0.75rem 2rem',
@@ -438,13 +545,94 @@ const DashboardApp = () => {
                     </div>
                 );
 
+            case 'insights':
+                return <AIInsightsDashboard workspace={currentWorkspace} />;
+
+            case 'themes':
+                return (
+                    <ThemeManager
+                        onThemeChange={handleThemeChange}
+                        currentTheme={currentTheme}
+                    />
+                );
+
+            case 'settings':
+                return (
+                    <SettingsPage
+                        currentTheme={currentTheme}
+                        onThemeChange={handleThemeChange}
+                    />
+                );
+
+            case 'activity':
+                return (
+                    <div>
+                        <h2 style={{
+                            margin: '0 0 2rem 0',
+                            fontSize: '2rem',
+                            fontWeight: '600',
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '0.5rem'
+                        }}>
+                            📋 Activity Log
+                        </h2>
+                        <div style={{
+                            backgroundColor: 'white',
+                            borderRadius: '12px',
+                            border: '1px solid #e2e8f0',
+                            overflow: 'hidden'
+                        }}>
+                            {activityLog.length === 0 ? (
+                                <div style={{
+                                    padding: '3rem',
+                                    textAlign: 'center',
+                                    color: '#718096'
+                                }}>
+                                    <div style={{ fontSize: '3rem', marginBottom: '1rem' }}>📝</div>
+                                    <p>No recent activity to display</p>
+                                </div>
+                            ) : (
+                                activityLog.map((activity, index) => (
+                                    <div
+                                        key={activity.id || index}
+                                        style={{
+                                            padding: '1rem 1.5rem',
+                                            borderBottom: index < activityLog.length - 1 ? '1px solid #e2e8f0' : 'none',
+                                            display: 'flex',
+                                            justifyContent: 'space-between',
+                                            alignItems: 'center'
+                                        }}
+                                    >
+                                        <div>
+                                            <div style={{ fontWeight: '500', marginBottom: '0.25rem' }}>
+                                                {activity.details || activity.action}
+                                            </div>
+                                            <div style={{ fontSize: '0.875rem', color: '#718096' }}>
+                                                {activity.entityType} • {activity.userId}
+                                            </div>
+                                        </div>
+                                        <div style={{ fontSize: '0.875rem', color: '#a0aec0' }}>
+                                            {new Date(activity.timestamp).toLocaleDateString()}
+                                        </div>
+                                    </div>
+                                ))
+                            )}
+                        </div>
+                    </div>
+                );
+
             default:
                 return null;
         }
     };
 
     return (
-        <div style={{ minHeight: '100vh', backgroundColor: '#f8f9fa' }}>
+        <div style={{
+            minHeight: '100vh',
+            backgroundColor: currentTheme?.background || '#f8f9fa',
+            transition: 'background-color 0.3s ease'
+        }}>
             {/* Header */}
             <header style={{
                 backgroundColor: 'white',
@@ -471,14 +659,60 @@ const DashboardApp = () => {
                         <h1 style={{
                             fontSize: '1.75rem',
                             fontWeight: '700',
-                            color: '#2d3748',
-                            margin: 0
+                            color: currentTheme?.primary || '#2d3748',
+                            margin: 0,
+                            transition: 'color 0.3s ease'
                         }}>
                             🚀 Enhanced Asana Dashboard
                         </h1>
                     </button>
-                    <div style={{ color: '#718096', fontWeight: '500' }}>
-                        Welcome, {user?.name}! 👋
+
+                    <div style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '1rem'
+                    }}>
+                        <div style={{ color: '#718096', fontWeight: '500' }}>
+                            Welcome, {user?.name}! 👋
+                        </div>
+
+                        {/* Notification Bell */}
+                        <button
+                            onClick={() => setShowNotifications(true)}
+                            style={{
+                                position: 'relative',
+                                background: 'none',
+                                border: 'none',
+                                cursor: 'pointer',
+                                fontSize: '1.5rem',
+                                padding: '0.5rem',
+                                borderRadius: '6px',
+                                transition: 'background-color 0.2s'
+                            }}
+                            onMouseEnter={(e) => e.target.style.backgroundColor = '#f7fafc'}
+                            onMouseLeave={(e) => e.target.style.backgroundColor = 'transparent'}
+                        >
+                            🔔
+                            {getUnreadNotificationCount() > 0 && (
+                                <span style={{
+                                    position: 'absolute',
+                                    top: '0.25rem',
+                                    right: '0.25rem',
+                                    backgroundColor: '#e53e3e',
+                                    color: 'white',
+                                    borderRadius: '50%',
+                                    width: '18px',
+                                    height: '18px',
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    justifyContent: 'center',
+                                    fontSize: '0.75rem',
+                                    fontWeight: '600'
+                                }}>
+                                    {getUnreadNotificationCount()}
+                                </span>
+                            )}
+                        </button>
                     </div>
                 </div>
             </header>
@@ -494,6 +728,7 @@ const DashboardApp = () => {
                     <Navigation
                         currentView={currentView}
                         onNavigate={handleNavigate}
+                        currentTheme={currentTheme}
                     />
                 </aside>
 
@@ -528,6 +763,12 @@ const DashboardApp = () => {
                     onCancel={() => setShowTaskModal(false)}
                 />
             </Modal>
+
+            {/* Notification Center */}
+            <NotificationCenter
+                isOpen={showNotifications}
+                onClose={() => setShowNotifications(false)}
+            />
         </div>
     );
 };

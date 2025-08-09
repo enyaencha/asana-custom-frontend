@@ -18,6 +18,7 @@ export const AsanaProvider = ({ children }) => {
     const [tasks, setTasks] = useState([]);
     const [workspaceUsers, setWorkspaceUsers] = useState([]);
     const [selectedProject, setSelectedProject] = useState(null);
+    const [selectedWorkspace, setSelectedWorkspace] = useState(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
     const [serverStatus, setServerStatus] = useState('checking');
@@ -57,37 +58,102 @@ export const AsanaProvider = ({ children }) => {
         }
     };
 
+    const loadProjects = async (workspaceId = null) => {
+        try {
+            setLoading(true);
+            setError(null);
+
+            let endpoint;
+            if (workspaceId) {
+                endpoint = `/projects?workspace=${workspaceId}&opt_fields=name,notes,public,color,archived,created_at,modified_at,owner,workspace`;
+            } else if (workspaces.length > 0) {
+                // If no workspace specified, use the first one
+                endpoint = `/projects?workspace=${workspaces[0].gid}&opt_fields=name,notes,public,color,archived,created_at,modified_at,owner,workspace`;
+            } else {
+                throw new Error('No workspace available');
+            }
+
+            const projectsData = await api.get(endpoint);
+            setProjects(projectsData.data || []);
+        } catch (err) {
+            console.error('Error loading projects:', err);
+            setError(`Failed to load projects: ${err.message}`);
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    const loadAllWorkspaceProjects = async () => {
+        try {
+            setLoading(true);
+            setError(null);
+
+            let allProjects = [];
+
+            // Load projects from all workspaces
+            for (const workspace of workspaces) {
+                try {
+                    const projectsData = await api.get(`/projects?workspace=${workspace.gid}&opt_fields=name,notes,public,color,archived,created_at,modified_at,owner,workspace`);
+                    if (projectsData.data) {
+                        // Add workspace info to each project
+                        const projectsWithWorkspace = projectsData.data.map(project => ({
+                            ...project,
+                            workspace: workspace
+                        }));
+                        allProjects = [...allProjects, ...projectsWithWorkspace];
+                    }
+                } catch (workspaceError) {
+                    console.warn(`Failed to load projects from workspace ${workspace.name}:`, workspaceError);
+                }
+            }
+
+            setProjects(allProjects);
+        } catch (err) {
+            console.error('Error loading all workspace projects:', err);
+            setError(`Failed to load projects: ${err.message}`);
+        } finally {
+            setLoading(false);
+        }
+    };
+
     const loadUserData = async () => {
         try {
             setLoading(true);
             setError(null);
 
+            // Load user and workspaces data
             const [userData, workspacesData] = await Promise.all([
                 api.get('/users/me'),
                 api.get('/workspaces')
             ]);
 
             setUser(userData.data);
-            setWorkspaces(workspacesData.data);
+            setWorkspaces(workspacesData.data || []);
 
             if (workspacesData.data?.length > 0) {
-                const workspaceId = workspacesData.data[0].gid;
+                // Set the first workspace as selected by default
+                const firstWorkspace = workspacesData.data[0];
+                setSelectedWorkspace(firstWorkspace);
 
-                const [projectsData, usersData] = await Promise.all([
-                    api.get(`/projects?workspace=${workspaceId}&opt_fields=name,notes,public,color,archived,created_at,modified_at,owner`),
-                    api.get(`/workspaces/${workspaceId}/users`)
-                ]);
+                // Load projects for the first workspace
+                await loadProjects(firstWorkspace.gid);
 
-                setProjects(projectsData.data || []);
-                setWorkspaceUsers(usersData.data || []);
+                // Load workspace users
+                try {
+                    const usersData = await api.get(`/workspaces/${firstWorkspace.gid}/users`);
+                    setWorkspaceUsers(usersData.data || []);
+                } catch (usersError) {
+                    console.warn('Failed to load workspace users:', usersError);
+                    setWorkspaceUsers([]);
+                }
             } else {
                 setProjects([]);
                 setWorkspaceUsers([]);
             }
 
-            setLoading(false);
         } catch (err) {
             setError(`Failed to load data: ${err.message}`);
+        } finally {
             setLoading(false);
         }
     };
@@ -95,20 +161,80 @@ export const AsanaProvider = ({ children }) => {
     const loadProjectTasks = async (project) => {
         try {
             setLoading(true);
-            const tasksData = await api.get(`/tasks?project=${project.gid}&opt_fields=name,notes,completed,assignee,due_on,due_at,created_at,modified_at,priority,tags`);
+            const tasksData = await api.get(`/tasks?project=${project.gid}&opt_fields=name,notes,completed,assignee,due_on,due_at,created_at,modified_at,custom_fields,tags`);
             setTasks(tasksData.data || []);
             setSelectedProject(project);
-            setLoading(false);
         } catch (err) {
             setError(`Failed to load tasks: ${err.message}`);
+        } finally {
             setLoading(false);
+        }
+    };
+
+    const handleWorkspaceChange = async (workspace) => {
+        try {
+            setSelectedWorkspace(workspace);
+
+            if (workspace) {
+                // Load projects for the selected workspace
+                await loadProjects(workspace.gid);
+
+                // Load workspace users
+                try {
+                    const usersData = await api.get(`/workspaces/${workspace.gid}/users`);
+                    setWorkspaceUsers(usersData.data || []);
+                } catch (usersError) {
+                    console.warn('Failed to load workspace users:', usersError);
+                    setWorkspaceUsers([]);
+                }
+            } else {
+                // Load projects from all workspaces
+                await loadAllWorkspaceProjects();
+
+                // Load users from all workspaces
+                let allUsers = [];
+                for (const ws of workspaces) {
+                    try {
+                        const usersData = await api.get(`/workspaces/${ws.gid}/users`);
+                        if (usersData.data) {
+                            allUsers = [...allUsers, ...usersData.data];
+                        }
+                    } catch (usersError) {
+                        console.warn(`Failed to load users from workspace ${ws.name}:`, usersError);
+                    }
+                }
+                // Remove duplicates based on gid
+                const uniqueUsers = allUsers.filter((user, index, arr) =>
+                    arr.findIndex(u => u.gid === user.gid) === index
+                );
+                setWorkspaceUsers(uniqueUsers);
+            }
+
+            // Clear selected project and tasks when switching workspaces
+            setSelectedProject(null);
+            setTasks([]);
+
+        } catch (err) {
+            setError(`Failed to change workspace: ${err.message}`);
         }
     };
 
     const createProject = async (projectData) => {
         try {
+            // If a workspace is selected, add it to the project data
+            if (selectedWorkspace) {
+                projectData.workspace = selectedWorkspace.gid;
+            }
+
             await api.post('/projects', projectData);
-            await loadUserData();
+
+            // Reload projects for current workspace context
+            if (selectedWorkspace) {
+                await loadProjects(selectedWorkspace.gid);
+            } else {
+                await loadAllWorkspaceProjects();
+            }
+
             return true;
         } catch (error) {
             throw error;
@@ -118,7 +244,14 @@ export const AsanaProvider = ({ children }) => {
     const updateProject = async (projectId, projectData) => {
         try {
             await api.put(`/projects/${projectId}`, projectData);
-            await loadUserData();
+
+            // Reload projects for current workspace context
+            if (selectedWorkspace) {
+                await loadProjects(selectedWorkspace.gid);
+            } else {
+                await loadAllWorkspaceProjects();
+            }
+
             return true;
         } catch (error) {
             throw error;
@@ -209,18 +342,24 @@ export const AsanaProvider = ({ children }) => {
     }, []);
 
     const value = {
+        // State
         user,
         workspaces,
         projects,
         tasks,
         workspaceUsers,
         selectedProject,
+        selectedWorkspace,
         loading,
         error,
         serverStatus,
 
+        // Functions
         loadUserData,
+        loadProjects,
+        loadAllWorkspaceProjects,
         loadProjectTasks,
+        handleWorkspaceChange,
         createProject,
         updateProject,
         deleteProject,
@@ -230,6 +369,8 @@ export const AsanaProvider = ({ children }) => {
         toggleTaskComplete,
         checkServerConnection,
 
+        // Setters
+        setSelectedWorkspace,
         setError,
         setLoading,
         setServerStatus
