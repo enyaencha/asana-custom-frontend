@@ -77,222 +77,6 @@ const addActivityLog = (action, entityType, entityName, userId = 'current_user')
   }
 };
 
-// Utility function to create custom fields if they don't exist
-const ensureCustomFieldsExist = async (projectId) => {
-  try {
-    console.log('🔍 Checking custom fields for project:', projectId);
-
-    // First, try to get workspace and then fetch custom fields from workspace
-    const projectData = await makeAsanaRequest(`/projects/${projectId}?opt_fields=workspace`);
-    const workspaceId = projectData.data.workspace?.gid;
-
-    if (!workspaceId) {
-      console.error('❌ Could not determine workspace for project');
-      return [];
-    }
-
-    console.log('📋 Project workspace:', workspaceId);
-
-    // Get ALL workspace custom fields first
-    const workspaceFields = await makeAsanaRequest(`/workspaces/${workspaceId}/custom_fields?opt_fields=name,gid,enum_options.name,enum_options.gid,enum_options.color`);
-    const allWorkspaceFields = workspaceFields.data || [];
-
-    console.log('📋 All workspace custom fields:', allWorkspaceFields.map(f => `${f.name} (${f.gid})`));
-
-    // Find the Priority and Progress fields
-    const priorityField = allWorkspaceFields.find(field => field.name === "Priority");
-    const progressField = allWorkspaceFields.find(field => field.name === "Task Progress");
-
-    const fieldsToCreate = [];
-    const existingFields = [];
-
-    // Handle Priority field
-    if (!priorityField) {
-      console.log('🔴 Priority field not found in workspace, will create it');
-      fieldsToCreate.push({
-        name: "Priority",
-        description: "Task priority level - automatically created by Enhanced Asana Dashboard",
-        type: "enum",
-        workspace: workspaceId,
-        enum_options: [
-          { name: "High", color: "red", enabled: true },
-          { name: "Medium", color: "orange", enabled: true },
-          { name: "Low", color: "yellow-orange", enabled: true },
-          { name: "None", color: "none", enabled: true }
-        ]
-      });
-    } else {
-      console.log('✅ Priority field exists in workspace:', priorityField.gid);
-      existingFields.push(priorityField);
-    }
-
-    // Handle Progress field
-    if (!progressField) {
-      console.log('🟡 Task Progress field not found in workspace, will create it');
-      fieldsToCreate.push({
-        name: "Task Progress",
-        description: "Task progress status - automatically created by Enhanced Asana Dashboard",
-        type: "enum",
-        workspace: workspaceId,
-        enum_options: [
-          { name: "Not Started", color: "blue", enabled: true },
-          { name: "In Progress", color: "cool-gray", enabled: true },
-          { name: "Waiting", color: "yellow", enabled: true },
-          { name: "Deferred", color: "orange", enabled: true },
-          { name: "Done", color: "blue-green", enabled: true }
-        ]
-      });
-    } else {
-      console.log('✅ Task Progress field exists in workspace:', progressField.gid);
-      existingFields.push(progressField);
-    }
-
-    // Add existing fields to project (ignore "already exists" errors)
-    for (const field of existingFields) {
-      try {
-        console.log(`📌 Ensuring custom field is in project: ${field.name} (${field.gid})`);
-
-        await makeAsanaRequest(`/projects/${projectId}/addCustomFieldSetting`, 'POST', {
-          custom_field: field.gid,
-          is_important: true
-        });
-        console.log(`✅ Added custom field to project: ${field.name}`);
-
-      } catch (addError) {
-        // This is expected if the field already exists - that's OK!
-        if (addError.message.includes('Custom field already exists')) {
-          console.log(`✅ Custom field ${field.name} already in project - perfect!`);
-        } else {
-          console.error(`❌ Failed to add custom field ${field.name} to project:`, addError.message);
-        }
-      }
-    }
-
-    // Create missing fields
-    const createdFields = [];
-    for (const fieldData of fieldsToCreate) {
-      try {
-        console.log(`🚀 Creating custom field: ${fieldData.name} in workspace: ${workspaceId}`);
-
-        // Create the custom field
-        const newField = await makeAsanaRequest('/custom_fields', 'POST', fieldData);
-        console.log(`✅ Created custom field: ${newField.data.name} (${newField.data.gid})`);
-
-        // Add the field to the project
-        await makeAsanaRequest(`/projects/${projectId}/addCustomFieldSetting`, 'POST', {
-          custom_field: newField.data.gid,
-          is_important: true
-        });
-        console.log(`📌 Added new custom field to project: ${fieldData.name}`);
-
-        createdFields.push(newField.data);
-        existingFields.push(newField.data);
-
-        // Add to activity log
-        addActivityLog('Created', 'Custom Field', fieldData.name);
-
-      } catch (fieldError) {
-        console.error(`❌ Failed to create custom field ${fieldData.name}:`, fieldError.message);
-        // Continue with other fields even if one fails
-      }
-    }
-
-    // Return the fields we know exist (from workspace + any we created)
-    const finalFields = [
-      ...existingFields,
-      ...createdFields
-    ];
-
-    console.log('📋 Final available custom fields:', finalFields.map(f => `${f.name} (${f.gid}) with ${f.enum_options?.length || 0} options`));
-
-    return finalFields;
-
-  } catch (error) {
-    console.error('❌ Error ensuring custom fields exist:', error.message);
-    // Don't throw error, just return empty array so the task creation can continue
-    return [];
-  }
-};
-
-// Utility function to get or create custom field mapping
-const getCustomFieldMapping = async (projectId, customFieldsData) => {
-  try {
-    // Ensure custom fields exist first
-    const projectFields = await ensureCustomFieldsExist(projectId);
-
-    console.log('📋 Available project fields for mapping:');
-    projectFields.forEach(field => {
-      console.log(`  - ${field.name} (${field.gid})`);
-      if (field.enum_options) {
-        field.enum_options.forEach(option => {
-          console.log(`    * ${option.name} (${option.gid})`);
-        });
-      }
-    });
-
-    const customFieldsToUpdate = {};
-
-    // Handle Priority
-    if (customFieldsData.priority !== undefined) {
-      const priorityField = projectFields.find(field => field.name === "Priority");
-      if (priorityField && priorityField.enum_options) {
-        let enumOptionGid = null;
-        if (customFieldsData.priority && customFieldsData.priority !== 'None') {
-          const enumOption = priorityField.enum_options.find(option =>
-              option.name.toLowerCase() === customFieldsData.priority.toLowerCase()
-          );
-          enumOptionGid = enumOption?.gid || null;
-          console.log(`🎯 Mapping priority "${customFieldsData.priority}" to GID: ${enumOptionGid}`);
-
-          if (!enumOptionGid) {
-            console.warn(`⚠️ Could not find enum option for priority: ${customFieldsData.priority}`);
-            console.log('Available priority options:', priorityField.enum_options.map(opt => opt.name));
-          }
-        } else {
-          console.log('🎯 Setting priority to None (null)');
-        }
-
-        customFieldsToUpdate[priorityField.gid] = enumOptionGid;
-      } else {
-        console.warn('⚠️ Priority field not found in project fields or missing enum options');
-      }
-    }
-
-    // Handle Progress
-    if (customFieldsData.progress !== undefined) {
-      const progressField = projectFields.find(field => field.name === "Task Progress");
-      if (progressField && progressField.enum_options) {
-        let enumOptionGid = null;
-        if (customFieldsData.progress) {
-          const enumOption = progressField.enum_options.find(option =>
-              option.name === customFieldsData.progress
-          );
-          enumOptionGid = enumOption?.gid || null;
-          console.log(`🚀 Mapping progress "${customFieldsData.progress}" to GID: ${enumOptionGid}`);
-
-          if (!enumOptionGid) {
-            console.warn(`⚠️ Could not find enum option for progress: ${customFieldsData.progress}`);
-            console.log('Available progress options:', progressField.enum_options.map(opt => opt.name));
-          }
-        } else {
-          console.log('🚀 Setting progress to null');
-        }
-
-        customFieldsToUpdate[progressField.gid] = enumOptionGid;
-      } else {
-        console.warn('⚠️ Task Progress field not found in project fields or missing enum options');
-      }
-    }
-
-    console.log('📤 Final custom field mapping:', customFieldsToUpdate);
-    return customFieldsToUpdate;
-
-  } catch (error) {
-    console.error('❌ Error getting custom field mapping:', error.message);
-    return {};
-  }
-};
-
 // ========== USER & WORKSPACE ENDPOINTS ==========
 
 app.get('/api/users/me', async (req, res) => {
@@ -551,23 +335,47 @@ app.post('/api/tasks', async (req, res) => {
 
     console.log('✅ Task created with ID:', newTaskId);
 
-    // If we have custom fields, set them after creation
+    // If we have custom fields, update them after creation
     if (custom_fields && newTaskId) {
       console.log('📋 Setting custom fields on new task...');
 
       try {
+        // Get the project's custom fields to find the GIDs
         const projectId = Array.isArray(projects) ? projects[0] : projects;
+        const projectData = await makeAsanaRequest(`/projects/${projectId}?opt_fields=custom_fields`);
 
-        // Use the new utility function that creates fields if they don't exist
-        const customFieldsToUpdate = await getCustomFieldMapping(projectId, custom_fields);
+        const customFieldsToUpdate = {};
 
-        // Update the task with custom fields if we have any
+        // Handle Priority
+        if (custom_fields.priority && custom_fields.priority !== 'None') {
+          const priorityField = projectData.data.custom_fields?.find(field => field.name === "Priority");
+          if (priorityField) {
+            const enumOption = priorityField.enum_options?.find(option =>
+                option.name.toLowerCase() === custom_fields.priority.toLowerCase()
+            );
+            if (enumOption) {
+              customFieldsToUpdate[priorityField.gid] = enumOption.gid;
+            }
+          }
+        }
+
+        // Handle Progress
+        if (custom_fields.progress) {
+          const progressField = projectData.data.custom_fields?.find(field => field.name === "Task Progress");
+          if (progressField) {
+            const enumOption = progressField.enum_options?.find(option =>
+                option.name === custom_fields.progress
+            );
+            if (enumOption) {
+              customFieldsToUpdate[progressField.gid] = enumOption.gid;
+            }
+          }
+        }
+
+        // Update the task with custom fields
         if (Object.keys(customFieldsToUpdate).length > 0) {
           console.log('📤 Updating new task custom fields:', customFieldsToUpdate);
           await makeAsanaRequest(`/tasks/${newTaskId}`, 'PUT', { custom_fields: customFieldsToUpdate });
-          console.log('✅ Custom fields set successfully!');
-        } else {
-          console.warn('⚠️ No custom fields to update - mapping returned empty object');
         }
 
       } catch (customFieldError) {
@@ -606,31 +414,56 @@ app.put('/api/tasks/:taskId', async (req, res) => {
     if (custom_fields) {
       console.log('📋 Processing custom fields:', custom_fields);
 
-      try {
-        // First, get the task to find which project it belongs to
-        const currentTask = await makeAsanaRequest(`/tasks/${taskId}?opt_fields=projects`);
-        const projectId = currentTask.data.projects?.[0]?.gid;
+      // First, get the task to find the custom field GIDs
+      const currentTask = await makeAsanaRequest(`/tasks/${taskId}?opt_fields=custom_fields`);
+      console.log('📥 Current task custom fields:', JSON.stringify(currentTask.data.custom_fields, null, 2));
 
-        if (projectId) {
-          console.log('🏗️ Found task project:', projectId);
+      const customFieldsToUpdate = {};
 
-          // Use the new utility function that creates fields if they don't exist
-          const customFieldsToUpdate = await getCustomFieldMapping(projectId, custom_fields);
+      // Handle Priority custom field
+      if (custom_fields.priority !== undefined) {
+        const priorityField = currentTask.data.custom_fields?.find(field => field.name === "Priority");
+        if (priorityField) {
+          console.log('🔴 Found Priority field:', priorityField.gid);
 
-          // Add custom fields to update data if we have any
-          if (Object.keys(customFieldsToUpdate).length > 0) {
-            updateData.custom_fields = customFieldsToUpdate;
-            console.log('📤 Final custom fields to send:', customFieldsToUpdate);
-          } else {
-            console.warn('⚠️ No custom fields to update - mapping returned empty object');
+          // Find the enum option for the priority value
+          let enumOptionGid = null;
+          if (custom_fields.priority && custom_fields.priority !== 'None') {
+            const enumOption = priorityField.enum_options?.find(option =>
+                option.name.toLowerCase() === custom_fields.priority.toLowerCase()
+            );
+            enumOptionGid = enumOption?.gid || null;
+            console.log(`🎯 Setting priority to "${custom_fields.priority}" (GID: ${enumOptionGid})`);
           }
-        } else {
-          console.log('⚠️ Could not find project for task, skipping custom fields');
-        }
 
-      } catch (customFieldError) {
-        console.error('⚠️ Custom field processing failed:', customFieldError.message);
-        // Continue without custom fields
+          customFieldsToUpdate[priorityField.gid] = enumOptionGid;
+        }
+      }
+
+      // Handle Progress custom field
+      if (custom_fields.progress !== undefined) {
+        const progressField = currentTask.data.custom_fields?.find(field => field.name === "Task Progress");
+        if (progressField) {
+          console.log('🟡 Found Progress field:', progressField.gid);
+
+          // Find the enum option for the progress value
+          let enumOptionGid = null;
+          if (custom_fields.progress) {
+            const enumOption = progressField.enum_options?.find(option =>
+                option.name === custom_fields.progress
+            );
+            enumOptionGid = enumOption?.gid || null;
+            console.log(`🚀 Setting progress to "${custom_fields.progress}" (GID: ${enumOptionGid})`);
+          }
+
+          customFieldsToUpdate[progressField.gid] = enumOptionGid;
+        }
+      }
+
+      // Add custom fields to update data if we have any
+      if (Object.keys(customFieldsToUpdate).length > 0) {
+        updateData.custom_fields = customFieldsToUpdate;
+        console.log('📤 Final custom fields to send:', customFieldsToUpdate);
       }
     }
 
@@ -647,52 +480,6 @@ app.put('/api/tasks/:taskId', async (req, res) => {
     res.json(data);
   } catch (error) {
     console.error('❌ Task update error:', error.message);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Add endpoint to manually create custom fields for a project
-app.post('/api/projects/:projectId/custom-fields/ensure', async (req, res) => {
-  try {
-    const { projectId } = req.params;
-    console.log('🔧 Manual custom field creation requested for project:', projectId);
-
-    const createdFields = await ensureCustomFieldsExist(projectId);
-
-    res.json({
-      data: {
-        message: 'Custom fields ensured successfully',
-        fields: createdFields,
-        count: createdFields.length
-      }
-    });
-  } catch (error) {
-    console.error('❌ Manual custom field creation error:', error.message);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Add endpoint to get custom fields for a project
-app.get('/api/projects/:projectId/custom-fields', async (req, res) => {
-  try {
-    const { projectId } = req.params;
-    const projectData = await makeAsanaRequest(`/projects/${projectId}?opt_fields=custom_fields`);
-
-    const customFields = projectData.data.custom_fields || [];
-    const priorityField = customFields.find(f => f.name === "Priority");
-    const progressField = customFields.find(f => f.name === "Task Progress");
-
-    res.json({
-      data: {
-        all_fields: customFields,
-        priority_field: priorityField || null,
-        progress_field: progressField || null,
-        has_priority: !!priorityField,
-        has_progress: !!progressField
-      }
-    });
-  } catch (error) {
-    console.error('❌ Get custom fields error:', error.message);
     res.status(500).json({ error: error.message });
   }
 });
@@ -1305,7 +1092,7 @@ app.get('/api/health', (req, res) => {
 // ========== SERVER STARTUP ==========
 
 app.listen(PORT, () => {
-  console.log('🚀 Enhanced Asana Server v2.1 Started!');
+  console.log('🚀 Enhanced Asana Server v2.0 Started!');
   console.log(`📍 http://localhost:${PORT}`);
   console.log(`🔑 Token: ${process.env.VITE_ASANA_TOKEN ? 'Present ✅' : 'Missing ❌'}`);
   console.log('✨ New Features: Themes, AI Insights, Notifications, Analytics & Custom Fields!');
@@ -1361,14 +1148,5 @@ app.listen(PORT, () => {
   console.log('    POST /api/webhooks');
   console.log('  💊 HEALTH:');
   console.log('    GET  /api/health');
-  console.log('  🔧 CUSTOM FIELD ENDPOINTS:');
-  console.log('    GET  /api/projects/:id/custom-fields');
-  console.log('    POST /api/projects/:id/custom-fields/ensure');
-  console.log('');
-  console.log('🤖 SMART FEATURES:');
-  console.log('  ✨ Auto-creates Priority & Progress custom fields if missing');
-  console.log('  🔄 Seamless integration with existing Asana projects');
-  console.log('  📊 Full custom field mapping and validation');
-  console.log('  🎯 Enhanced custom field enum option fetching');
-  console.log('  🚀 CUSTOM FIELDS SUPPORT: Priority & Progress tracking enabled!');
+  console.log('  🎯 CUSTOM FIELDS SUPPORT: Priority & Progress tracking enabled!');
 });
