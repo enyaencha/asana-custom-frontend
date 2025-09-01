@@ -1,73 +1,100 @@
 // components/TaskItem.jsx
-import React from 'react';
+import React, { useState } from 'react';
 import { useAsana } from '../context/AsanaContext.jsx';
-// import { extractPriority, extractTaskProgress } from '../utils/taskHelpers.jsx';
 
-const TaskItem = ({ task, onEdit, onDelete }) => {
-    const { toggleTaskComplete, workspaceUsers } = useAsana();
+const TaskItem = ({ task, onEdit, onDelete, showProject = false }) => {
+    const { toggleTaskComplete, workspaceUsers, updateTask } = useAsana();
 
-    // Add these functions directly for now
+    // State for inline editing
+    const [editingPriority, setEditingPriority] = useState(false);
+    const [editingProgress, setEditingProgress] = useState(false);
+    const [updating, setUpdating] = useState(false);
+
+    // Priority and Progress options (same as TaskForm)
+    const priorityOptions = [
+        { value: 'None', label: 'No Priority', color: '#9ca3af', icon: '⚪' },
+        { value: 'Low', label: 'Low Priority', color: '#10b981', icon: '🔵' },
+        { value: 'Medium', label: 'Medium Priority', color: '#c5800b', icon: '🟡' },
+        { value: 'High', label: 'High Priority', color: '#ef0909', icon: '🔴' }
+    ];
+
+    const progressOptions = [
+        { value: 'Not Started', label: 'Not Started', color: '#6b7280', icon: '⭕' },
+        { value: 'In Progress', label: 'In Progress', color: '#d97706', icon: '🟡' },
+        { value: 'Waiting', label: 'Waiting', color: '#ca8a04', icon: '⏸️' },
+        { value: 'Deferred', label: 'Deferred', color: '#ea580c', icon: '⏭️' },
+        { value: 'Done', label: 'Done', color: '#065f46', icon: '✅' }
+    ];
+
+    // Extract functions
     const extractPriority = (task) => {
         const priorityField = task.custom_fields?.find(field => field.name === "Priority");
         const priority = priorityField?.enum_value?.name;
-        console.log('Priority field found:', priorityField);
-        console.log('Priority value:', priority);
-        return priority?.toLowerCase() || null;
+        return priority || 'None';
     };
 
     const extractTaskProgress = (task) => {
         const progressField = task.custom_fields?.find(field => field.name === "Task Progress");
-        return progressField?.enum_value?.name || null;
+        return progressField?.enum_value?.name || 'Not Started';
     };
 
     const extractAssignee = (task) => {
-        // Use the same method as TaskForm - lookup in workspaceUsers
         if (task.assignee) {
-            console.log('Assignee found:', task.assignee);
-
-            // First try to get the name directly if it exists
             if (task.assignee.name) {
                 return task.assignee.name;
             }
-
-            // If no name, lookup in workspaceUsers using gid (same as TaskForm)
             if (task.assignee.gid && workspaceUsers) {
                 const user = workspaceUsers.find(u => u.gid === task.assignee.gid);
-                console.log('Found user in workspaceUsers:', user);
                 return user?.name || `User ${task.assignee.gid}`;
             }
-
             return 'Assigned';
         }
         return null;
     };
 
-    // Function to fetch user name by GID (similar to your task form)
-    const [assigneeName, setAssigneeName] = React.useState(null);
+    // Handle priority update
+    const handlePriorityUpdate = async (newPriority) => {
+        if (updating) return;
 
-    React.useEffect(() => {
-        const fetchAssigneeName = async () => {
-            if (task.assignee && task.assignee.gid && !task.assignee.name) {
-                try {
-                    // Use the same method as your task form to fetch user details
-                    const response = await fetch(`/api/asana/users/${task.assignee.gid}`, {
-                        headers: {
-                            'Authorization': 'Bearer YOUR_TOKEN' // You'll need to get this from your context
-                        }
-                    });
-                    const userData = await response.json();
-                    if (userData && userData.data) {
-                        setAssigneeName(userData.data.name);
-                    }
-                } catch (error) {
-                    console.error('Error fetching assignee name:', error);
-                    setAssigneeName(null);
+        setUpdating(true);
+        try {
+            const updateData = {
+                custom_fields: {
+                    priority: newPriority === 'None' ? null : newPriority
                 }
-            }
-        };
+            };
 
-        fetchAssigneeName();
-    }, [task.assignee]);
+            await updateTask(task.gid, updateData);
+            setEditingPriority(false);
+        } catch (error) {
+            console.error('Error updating priority:', error);
+            alert(`Error updating priority: ${error.message}`);
+        } finally {
+            setUpdating(false);
+        }
+    };
+
+    // Handle progress update
+    const handleProgressUpdate = async (newProgress) => {
+        if (updating) return;
+
+        setUpdating(true);
+        try {
+            const updateData = {
+                custom_fields: {
+                    progress: newProgress
+                }
+            };
+
+            await updateTask(task.gid, updateData);
+            setEditingProgress(false);
+        } catch (error) {
+            console.error('Error updating progress:', error);
+            alert(`Error updating progress: ${error.message}`);
+        } finally {
+            setUpdating(false);
+        }
+    };
 
     const handleToggleComplete = async () => {
         try {
@@ -80,84 +107,32 @@ const TaskItem = ({ task, onEdit, onDelete }) => {
 
     // Priority configuration
     const getPriorityConfig = (priority) => {
-        console.log('Getting priority config for:', priority);
-        switch (priority) {
-            case 'high':
-                return {
-                    label: 'High',
-                    icon: '🔴',
-                    bgColor: '#fef2f2',
-                    textColor: '#dc2626',
-                    borderColor: '#fecaca'
-                };
-            case 'medium':
-                return {
-                    label: 'Medium',
-                    icon: '🟡',
-                    bgColor: '#fffbeb',
-                    textColor: '#d97706',
-                    borderColor: '#fed7aa'
-                };
-            case 'low':
-                return {
-                    label: 'Low',
-                    icon: '🔵',
-                    bgColor: '#eff6ff',
-                    textColor: '#2563eb',
-                    borderColor: '#bfdbfe'
-                };
-            default:
-                return null;
-        }
+        const option = priorityOptions.find(opt => opt.value === priority);
+        if (!option || priority === 'None') return null;
+
+        return {
+            label: option.label,
+            icon: option.icon,
+            bgColor: priority === 'high' ? '#fef2f2' : priority === 'medium' ? '#fffbeb' : '#eff6ff',
+            textColor: option.color,
+            borderColor: priority === 'high' ? '#fecaca' : priority === 'medium' ? '#fed7aa' : '#bfdbfe'
+        };
     };
 
     // Progress configuration
     const getProgressConfig = (progress) => {
-        console.log('Getting progress config for:', progress);
-        switch (progress) {
-            case 'Not Started':
-                return {
-                    label: 'Not Started',
-                    icon: '⭕',
-                    bgColor: '#f3f4f6',
-                    textColor: '#6b7280',
-                    borderColor: '#d1d5db'
-                };
-            case 'In Progress':
-                return {
-                    label: 'In Progress',
-                    icon: '🟡',
-                    bgColor: '#fef3c7',
-                    textColor: '#d97706',
-                    borderColor: '#fcd34d'
-                };
-            case 'Waiting':
-                return {
-                    label: 'Waiting',
-                    icon: '⏸️',
-                    bgColor: '#fef9c3',
-                    textColor: '#ca8a04',
-                    borderColor: '#fde047'
-                };
-            case 'Deferred':
-                return {
-                    label: 'Deferred',
-                    icon: '⏭️',
-                    bgColor: '#fed7aa',
-                    textColor: '#ea580c',
-                    borderColor: '#fb923c'
-                };
-            case 'Done':
-                return {
-                    label: 'Done',
-                    icon: '✅',
-                    bgColor: '#d1fae5',
-                    textColor: '#065f46',
-                    borderColor: '#34d399'
-                };
-            default:
-                return null;
-        }
+        const option = progressOptions.find(opt => opt.value === progress);
+        if (!option || progress === 'Not Started') return null;
+
+        return {
+            label: option.label,
+            icon: option.icon,
+            bgColor: progress === 'Done' ? '#d1fae5' : progress === 'In Progress' ? '#fef3c7' :
+                progress === 'Waiting' ? '#fef9c3' : '#fed7aa',
+            textColor: option.color,
+            borderColor: progress === 'Done' ? '#34d399' : progress === 'In Progress' ? '#fcd34d' :
+                progress === 'Waiting' ? '#fde047' : '#fb923c'
+        };
     };
 
     // Due date status
@@ -179,21 +154,109 @@ const TaskItem = ({ task, onEdit, onDelete }) => {
         return { status: 'future', color: '#6b7280', bgColor: 'transparent' };
     };
 
-    // Extract values and add debug logging
-    console.log('Task object:', task);
-    console.log('Workspace users:', workspaceUsers);
+    // Extract values
     const taskPriority = extractPriority(task);
     const taskProgress = extractTaskProgress(task);
-    const taskAssignee = extractAssignee(task); // Now uses workspaceUsers lookup like TaskForm
+    const taskAssignee = extractAssignee(task);
     const priorityConfig = getPriorityConfig(taskPriority);
     const progressConfig = getProgressConfig(taskProgress);
     const dueDateStatus = getDueDateStatus();
 
-    console.log('Task priority:', taskPriority);
-    console.log('Priority config:', priorityConfig);
-    console.log('Task progress:', taskProgress);
-    console.log('Progress config:', progressConfig);
-    console.log('Task assignee:', taskAssignee);
+    // Priority dropdown component
+    const PriorityDropdown = () => (
+        <div style={{
+            position: 'absolute',
+            top: '100%',
+            left: '0',
+            backgroundColor: 'white',
+            border: '1px solid #e5e7eb',
+            borderRadius: '8px',
+            boxShadow: '0 4px 12px rgba(0, 0, 0, 0.15)',
+            zIndex: 1000,
+            minWidth: '150px',
+            marginTop: '4px'
+        }}>
+            {priorityOptions.map(option => (
+                <button
+                    key={option.value}
+                    onClick={() => handlePriorityUpdate(option.value)}
+                    disabled={updating}
+                    style={{
+                        width: '100%',
+                        padding: '0.5rem 0.75rem',
+                        border: 'none',
+                        backgroundColor: 'transparent',
+                        cursor: updating ? 'not-allowed' : 'pointer',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '0.5rem',
+                        fontSize: '0.75rem',
+                        color: option.color,
+                        fontWeight: taskPriority === option.value ? '600' : 'normal',
+                        opacity: updating ? 0.5 : 1
+                    }}
+                    onMouseEnter={(e) => {
+                        if (!updating) e.target.style.backgroundColor = '#f9fafb';
+                    }}
+                    onMouseLeave={(e) => {
+                        e.target.style.backgroundColor = 'transparent';
+                    }}
+                >
+                    <span>{option.icon}</span>
+                    <span>{option.label}</span>
+                    {taskPriority === option.value && <span style={{ marginLeft: 'auto' }}>✓</span>}
+                </button>
+            ))}
+        </div>
+    );
+
+    // Progress dropdown component
+    const ProgressDropdown = () => (
+        <div style={{
+            position: 'absolute',
+            top: '100%',
+            left: '0',
+            backgroundColor: 'white',
+            border: '1px solid #e5e7eb',
+            borderRadius: '8px',
+            boxShadow: '0 4px 12px rgba(0, 0, 0, 0.15)',
+            zIndex: 1000,
+            minWidth: '150px',
+            marginTop: '4px'
+        }}>
+            {progressOptions.map(option => (
+                <button
+                    key={option.value}
+                    onClick={() => handleProgressUpdate(option.value)}
+                    disabled={updating}
+                    style={{
+                        width: '100%',
+                        padding: '0.5rem 0.75rem',
+                        border: 'none',
+                        backgroundColor: 'transparent',
+                        cursor: updating ? 'not-allowed' : 'pointer',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '0.5rem',
+                        fontSize: '0.75rem',
+                        color: option.color,
+                        fontWeight: taskProgress === option.value ? '600' : 'normal',
+                        opacity: updating ? 0.5 : 1
+                    }}
+                    onMouseEnter={(e) => {
+                        if (!updating) e.target.style.backgroundColor = '#f9fafb';
+                    }}
+                    onMouseLeave={(e) => {
+                        e.target.style.backgroundColor = 'transparent';
+                    }}
+                >
+                    <span>{option.icon}</span>
+                    <span>{option.label}</span>
+                    {taskProgress === option.value && <span style={{ marginLeft: 'auto' }}>✓</span>}
+                </button>
+            ))}
+        </div>
+    );
 
     return (
         <div style={{
@@ -238,6 +301,19 @@ const TaskItem = ({ task, onEdit, onDelete }) => {
                     wordBreak: 'break-word'
                 }}>
                     {task.name}
+                    {showProject && task.projects && task.projects.length > 0 && (
+                        <span style={{
+                            marginLeft: '0.5rem',
+                            fontSize: '0.75rem',
+                            fontWeight: '400',
+                            color: '#6b7280',
+                            backgroundColor: '#f3f4f6',
+                            padding: '0.125rem 0.5rem',
+                            borderRadius: '12px'
+                        }}>
+                            📁 {task.projects[0].name}
+                        </span>
+                    )}
                 </h4>
 
                 {/* Task Notes */}
@@ -324,43 +400,153 @@ const TaskItem = ({ task, onEdit, onDelete }) => {
                         </span>
                     )}
 
-                    {/* Priority */}
-                    {priorityConfig && (
-                        <span style={{
-                            backgroundColor: priorityConfig.bgColor,
-                            color: priorityConfig.textColor,
-                            border: `1px solid ${priorityConfig.borderColor}`,
-                            padding: '0.125rem 0.5rem',
-                            borderRadius: '12px',
-                            fontSize: '0.75rem',
-                            fontWeight: '600',
-                            display: 'flex',
-                            alignItems: 'center',
-                            gap: '0.25rem'
-                        }}>
-                            <span>{priorityConfig.icon}</span>
-                            <span>{priorityConfig.label}</span>
-                        </span>
-                    )}
+                    {/* Clickable Priority */}
+                    <div style={{ position: 'relative' }}>
+                        {priorityConfig ? (
+                            <button
+                                onClick={() => setEditingPriority(!editingPriority)}
+                                disabled={updating}
+                                style={{
+                                    backgroundColor: priorityConfig.bgColor,
+                                    color: priorityConfig.textColor,
+                                    border: `1px solid ${priorityConfig.borderColor}`,
+                                    padding: '0.125rem 0.5rem',
+                                    borderRadius: '12px',
+                                    fontSize: '0.75rem',
+                                    fontWeight: '600',
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    gap: '0.25rem',
+                                    cursor: updating ? 'not-allowed' : 'pointer',
+                                    transition: 'all 0.2s',
+                                    opacity: updating ? 0.5 : 1
+                                }}
+                                onMouseEnter={(e) => {
+                                    if (!updating) {
+                                        e.target.style.transform = 'scale(1.05)';
+                                        e.target.style.boxShadow = '0 2px 4px rgba(0,0,0,0.1)';
+                                    }
+                                }}
+                                onMouseLeave={(e) => {
+                                    e.target.style.transform = 'scale(1)';
+                                    e.target.style.boxShadow = 'none';
+                                }}
+                                title="Click to change priority"
+                            >
+                                <span>{priorityConfig.icon}</span>
+                                <span>{priorityConfig.label}</span>
+                                <span style={{ fontSize: '0.6rem' }}>▼</span>
+                            </button>
+                        ) : (
+                            <button
+                                onClick={() => setEditingPriority(!editingPriority)}
+                                disabled={updating}
+                                style={{
+                                    backgroundColor: '#f3f4f6',
+                                    color: '#9ca3af',
+                                    border: '1px solid #e5e7eb',
+                                    padding: '0.125rem 0.5rem',
+                                    borderRadius: '12px',
+                                    fontSize: '0.75rem',
+                                    fontWeight: '500',
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    gap: '0.25rem',
+                                    cursor: updating ? 'not-allowed' : 'pointer',
+                                    transition: 'all 0.2s',
+                                    opacity: updating ? 0.5 : 1
+                                }}
+                                onMouseEnter={(e) => {
+                                    if (!updating) {
+                                        e.target.style.backgroundColor = '#e5e7eb';
+                                    }
+                                }}
+                                onMouseLeave={(e) => {
+                                    e.target.style.backgroundColor = '#f3f4f6';
+                                }}
+                                title="Click to set priority"
+                            >
+                                <span>⚪</span>
+                                <span>No Priority</span>
+                                <span style={{ fontSize: '0.6rem' }}>▼</span>
+                            </button>
+                        )}
+                        {editingPriority && <PriorityDropdown />}
+                    </div>
 
-                    {/* Progress */}
-                    {progressConfig && (
-                        <span style={{
-                            backgroundColor: progressConfig.bgColor,
-                            color: progressConfig.textColor,
-                            border: `1px solid ${progressConfig.borderColor}`,
-                            padding: '0.125rem 0.5rem',
-                            borderRadius: '12px',
-                            fontSize: '0.75rem',
-                            fontWeight: '600',
-                            display: 'flex',
-                            alignItems: 'center',
-                            gap: '0.25rem'
-                        }}>
-                            <span>{progressConfig.icon}</span>
-                            <span>{progressConfig.label}</span>
-                        </span>
-                    )}
+                    {/* Clickable Progress */}
+                    <div style={{ position: 'relative' }}>
+                        {progressConfig ? (
+                            <button
+                                onClick={() => setEditingProgress(!editingProgress)}
+                                disabled={updating}
+                                style={{
+                                    backgroundColor: progressConfig.bgColor,
+                                    color: progressConfig.textColor,
+                                    border: `1px solid ${progressConfig.borderColor}`,
+                                    padding: '0.125rem 0.5rem',
+                                    borderRadius: '12px',
+                                    fontSize: '0.75rem',
+                                    fontWeight: '600',
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    gap: '0.25rem',
+                                    cursor: updating ? 'not-allowed' : 'pointer',
+                                    transition: 'all 0.2s',
+                                    opacity: updating ? 0.5 : 1
+                                }}
+                                onMouseEnter={(e) => {
+                                    if (!updating) {
+                                        e.target.style.transform = 'scale(1.05)';
+                                        e.target.style.boxShadow = '0 2px 4px rgba(0,0,0,0.1)';
+                                    }
+                                }}
+                                onMouseLeave={(e) => {
+                                    e.target.style.transform = 'scale(1)';
+                                    e.target.style.boxShadow = 'none';
+                                }}
+                                title="Click to change progress"
+                            >
+                                <span>{progressConfig.icon}</span>
+                                <span>{progressConfig.label}</span>
+                                <span style={{ fontSize: '0.6rem' }}>▼</span>
+                            </button>
+                        ) : (
+                            <button
+                                onClick={() => setEditingProgress(!editingProgress)}
+                                disabled={updating}
+                                style={{
+                                    backgroundColor: '#f3f4f6',
+                                    color: '#9ca3af',
+                                    border: '1px solid #e5e7eb',
+                                    padding: '0.125rem 0.5rem',
+                                    borderRadius: '12px',
+                                    fontSize: '0.75rem',
+                                    fontWeight: '500',
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    gap: '0.25rem',
+                                    cursor: updating ? 'not-allowed' : 'pointer',
+                                    transition: 'all 0.2s',
+                                    opacity: updating ? 0.5 : 1
+                                }}
+                                onMouseEnter={(e) => {
+                                    if (!updating) {
+                                        e.target.style.backgroundColor = '#e5e7eb';
+                                    }
+                                }}
+                                onMouseLeave={(e) => {
+                                    e.target.style.backgroundColor = '#f3f4f6';
+                                }}
+                                title="Click to set progress"
+                            >
+                                <span>⭕</span>
+                                <span>Not Started</span>
+                                <span style={{ fontSize: '0.6rem' }}>▼</span>
+                            </button>
+                        )}
+                        {editingProgress && <ProgressDropdown />}
+                    </div>
                 </div>
 
                 {/* Additional Task Info */}
@@ -482,6 +668,24 @@ const TaskItem = ({ task, onEdit, onDelete }) => {
                 }}>
                     ✓
                 </div>
+            )}
+
+            {/* Click outside to close dropdowns */}
+            {(editingPriority || editingProgress) && (
+                <div
+                    style={{
+                        position: 'fixed',
+                        top: 0,
+                        left: 0,
+                        right: 0,
+                        bottom: 0,
+                        zIndex: 999
+                    }}
+                    onClick={() => {
+                        setEditingPriority(false);
+                        setEditingProgress(false);
+                    }}
+                />
             )}
         </div>
     );
