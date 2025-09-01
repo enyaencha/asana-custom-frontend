@@ -1,7 +1,12 @@
-// components/Dashboard.jsx
+// components/Dashboard.jsx - Updated with SyncStatus
 import React, { useState, useEffect } from 'react';
 import { useAsana } from '../context/AsanaContext.jsx';
 import ProjectCard from './ProjectCard';
+import SyncStatus from './SyncStatus'; // ← ADD THIS IMPORT
+import DataPullButton from './DataPullButton';
+
+// Add this in your Dashboard component, maybe right after SyncStatus:
+<DataPullButton />
 
 const Dashboard = ({ onCreateProject, onProjectClick }) => {
     const {
@@ -61,6 +66,9 @@ const Dashboard = ({ onCreateProject, onProjectClick }) => {
 
     return (
         <div>
+            {/* ADD SYNC STATUS HERE - Right at the top */}
+            <SyncStatus />
+
             {/* Workspace Selector */}
             <div style={{
                 backgroundColor: 'white',
@@ -173,6 +181,7 @@ const Dashboard = ({ onCreateProject, onProjectClick }) => {
                 </div>
             </div>
 
+            {/* REST OF YOUR DASHBOARD COMPONENT STAYS THE SAME */}
             <h2 style={{
                 fontSize: '2rem',
                 fontWeight: '600',
