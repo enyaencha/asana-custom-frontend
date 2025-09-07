@@ -30,9 +30,19 @@ export const AsanaProvider = ({ children }) => {
     const [syncStatus, setSyncStatus] = useState('idle');
     const [queueStats, setQueueStats] = useState({ pending: 0, failed: 0, completed: 0 });
 
+
+
     // NEW: Track page state to prevent blank pages
     const [isUpdating, setIsUpdating] = useState(false);
     const [lastError, setLastError] = useState(null);
+
+    // Sync setting provider
+    const [cacheInfo, setCacheInfo] = useState({
+        projects: 0,
+        tasks: 0,
+        storageUsed: 0,
+        lastSync: null
+    });
 
     console.log('🚀 AsanaProvider starting - Local MySQL First + Sync Queue...');
 
@@ -911,6 +921,57 @@ export const AsanaProvider = ({ children }) => {
         }
     };
 
+    const clearLocalCache = async () => {
+        // Implementation to clear local cache
+        try {
+            // Clear your local database/cache
+            setCacheInfo({ projects: 0, tasks: 0, storageUsed: 0 });
+            setQueueStats({ pending: 0, failed: 0, completed: 0 });
+        } catch (error) {
+            console.error('Error clearing cache:', error);
+            throw error;
+        }
+    };
+
+    const updateCacheInfo = async () => {
+        // Implementation to update cache info
+        try {
+            // Get current cache statistics
+            const info = {
+                projects: projects.length,
+                tasks: tasks.length,
+                storageUsed: 0 // Calculate actual storage used
+            };
+            setCacheInfo(info);
+        } catch (error) {
+            console.error('Error updating cache info:', error);
+        }
+    };
+
+
+
+
+    const getSyncQueueStatus = () => {
+        return {
+            total: queueStats.pending + queueStats.failed,
+            pending: queueStats.pending,
+            failed: queueStats.failed,
+            retry: 3 // Add retry count if needed
+        };
+    };
+
+    const clearSyncQueue = async () => {
+        // Implementation to clear failed sync items
+        try {
+            setQueueStats(prev => ({ ...prev, failed: 0 }));
+        } catch (error) {
+            console.error('Error clearing sync queue:', error);
+            throw error;
+        }
+    };
+
+
+
     // Initialize local DB check
     useEffect(() => {
         checkLocalDB();
@@ -987,6 +1048,17 @@ export const AsanaProvider = ({ children }) => {
         deleteTask,
         toggleTaskComplete,
         checkServerConnection,
+
+        //Add these to your context value:
+
+        // Sync settings
+        cacheInfo,
+        clearLocalCache,
+        updateCacheInfo,
+        getSyncQueueStatus,
+        clearSyncQueue,
+        // ... rest of your existing values
+
 
         // NEW: Enhanced task update functions
         updateTaskPriority,

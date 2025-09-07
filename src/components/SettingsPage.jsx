@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { healthApi, webhookApi, userApi } from '../services/asanaApi';
+import SyncSettings from './SyncSettings.jsx';
 
 const SettingsPage = ({ currentTheme, onThemeChange }) => {
     const [activeTab, setActiveTab] = useState('general');
@@ -49,6 +50,7 @@ const SettingsPage = ({ currentTheme, onThemeChange }) => {
 
     const tabs = [
         { id: 'general', label: 'General', icon: '⚙️' },
+        { id: 'sync', label: 'Sync & Offline', icon: '🔄' },
         { id: 'appearance', label: 'Appearance', icon: '🎨' },
         { id: 'notifications', label: 'Notifications', icon: '🔔' },
         { id: 'integrations', label: 'Integrations', icon: '🔗' },
@@ -221,6 +223,9 @@ const SettingsPage = ({ currentTheme, onThemeChange }) => {
                         </div>
                     </div>
                 );
+
+            case 'sync':
+                return <SyncSettings />;
 
             case 'appearance':
                 return (

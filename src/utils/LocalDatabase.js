@@ -1,407 +1,463 @@
-// utils/LocalDatabase.js
+// utils/LocalDatabase.js - MySQL Integration with Enhanced Error Handling
 class LocalDatabase {
     constructor() {
-        this.dbName = 'AsanaLocalDB';
-        this.version = 1;
-        this.db = null;
+        this.baseURL = import.meta.env.VITE_LOCAL_SERVER_URL || 'http://localhost:3002/api';
+        this.isConnected = false;
+        this.lastHealthCheck = null;
+        console.log('LocalDatabase initialized with MySQL server URL:', this.baseURL);
     }
 
-    // Initialize the database
-    async init() {
-        if (this.db) return this.db;
+    // Enhanced health check with multiple endpoint attempts
+    async isAvailable() {
+        // Cache health check for 30 seconds to avoid excessive requests
+        const now = Date.now();
+        if (this.lastHealthCheck && (now - this.lastHealthCheck.timestamp) < 30000) {
+            return this.lastHealthCheck.status;
+        }
 
-        return new Promise((resolve, reject) => {
-            const request = indexedDB.open(this.dbName, this.version);
-
-            request.onerror = () => {
-                console.error('❌ Error opening IndexedDB:', request.error);
-                reject(request.error);
-            };
-
-            request.onsuccess = () => {
-                this.db = request.result;
-                console.log('✅ LocalDatabase initialized successfully');
-                resolve(this.db);
-            };
-
-            request.onupgradeneeded = (event) => {
-                const db = event.target.result;
-                console.log('🔧 Upgrading LocalDatabase schema...');
-
-                // Users store
-                if (!db.objectStoreNames.contains('users')) {
-                    const userStore = db.createObjectStore('users', { keyPath: 'gid' });
-                    userStore.createIndex('name', 'name', { unique: false });
-                }
-
-                // Workspaces store
-                if (!db.objectStoreNames.contains('workspaces')) {
-                    const workspaceStore = db.createObjectStore('workspaces', { keyPath: 'gid' });
-                    workspaceStore.createIndex('name', 'name', { unique: false });
-                }
-
-                // Projects store
-                if (!db.objectStoreNames.contains('projects')) {
-                    const projectStore = db.createObjectStore('projects', { keyPath: 'gid' });
-                    projectStore.createIndex('workspace', 'workspace.gid', { unique: false });
-                    projectStore.createIndex('name', 'name', { unique: false });
-                }
-
-                // Tasks store
-                if (!db.objectStoreNames.contains('tasks')) {
-                    const taskStore = db.createObjectStore('tasks', { keyPath: 'gid' });
-                    taskStore.createIndex('project', 'projects', { unique: false, multiEntry: true });
-                    taskStore.createIndex('assignee', 'assignee.gid', { unique: false });
-                    taskStore.createIndex('completed', 'completed', { unique: false });
-                }
-
-                // Sync queue store
-                if (!db.objectStoreNames.contains('syncQueue')) {
-                    const syncStore = db.createObjectStore('syncQueue', { keyPath: 'id', autoIncrement: true });
-                    syncStore.createIndex('timestamp', 'timestamp', { unique: false });
-                    syncStore.createIndex('priority', 'priority', { unique: false });
-                    syncStore.createIndex('status', 'status', { unique: false });
-                }
-
-                // Settings store
-                if (!db.objectStoreNames.contains('settings')) {
-                    db.createObjectStore('settings', { keyPath: 'key' });
-                }
-
-                console.log('✅ LocalDatabase schema upgraded successfully');
-            };
-        });
-    }
-
-    // Generic database operations
-    async getStore(storeName, mode = 'readonly') {
-        await this.init();
-        const transaction = this.db.transaction([storeName], mode);
-        return transaction.objectStore(storeName);
-    }
-
-    // Users operations
-    async saveUsers(users) {
+        // Your server has /health endpoint working
         try {
-            const store = await this.getStore('users', 'readwrite');
-            const promises = users.map(user => store.put({ ...user, lastUpdated: Date.now() }));
-            await Promise.all(promises);
-            console.log(`✅ Saved ${users.length} users to local database`);
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 3000);
+
+            const response = await fetch(`${this.baseURL}/health`, {
+                signal: controller.signal,
+                headers: { 'Accept': 'application/json' }
+            });
+
+            clearTimeout(timeoutId);
+
+            if (response.ok) {
+                const healthData = await response.json();
+                this.isConnected = true;
+                this.lastHealthCheck = { timestamp: now, status: true };
+                console.log('MySQL server is healthy:', healthData);
+                return true;
+            } else {
+                console.warn(`Health endpoint responded with status: ${response.status}`);
+            }
+
         } catch (error) {
-            console.error('❌ Error saving users:', error);
+            if (error.name === 'AbortError') {
+                console.log('Health check timeout');
+            } else {
+                console.log(`Health check failed: ${error.message}`);
+            }
+        }
+
+        // Health check failed
+        this.isConnected = false;
+        this.lastHealthCheck = { timestamp: now, status: false };
+        console.error('MySQL server health check failed. Server may be down or unreachable.');
+
+        return false;
+    }
+
+    // Enhanced HTTP request wrapper with better error handling
+    async makeRequest(endpoint, options = {}) {
+        const url = `${this.baseURL}${endpoint}`;
+        const defaultOptions = {
+            headers: {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                ...options.headers
+            }
+        };
+
+        try {
+            const response = await fetch(url, { ...defaultOptions, ...options });
+
+            if (!response.ok) {
+                const errorBody = await response.text();
+                throw new Error(`HTTP ${response.status}: ${response.statusText} - ${errorBody}`);
+            }
+
+            const contentType = response.headers.get('content-type');
+            if (contentType && contentType.includes('application/json')) {
+                const data = await response.json();
+                return data.data || data; // Handle both {data: [...]} and direct array responses
+            } else {
+                return await response.text();
+            }
+        } catch (error) {
+            console.error(`❌ Request failed: ${options.method || 'GET'} ${endpoint}`, error.message);
+            throw error;
         }
     }
 
-    async getUsers() {
+    // Settings Management
+    async getSyncSettings() {
         try {
-            const store = await this.getStore('users');
-            const request = store.getAll();
-            return new Promise((resolve, reject) => {
-                request.onsuccess = () => resolve(request.result || []);
-                request.onerror = () => reject(request.error);
-            });
+            const dbSettings = await this.makeRequest('/settings');
+
+            // Convert database format to component format
+            return {
+                autoSync: dbSettings.auto_sync_enabled || dbSettings.auto_sync || true,
+                syncIntervalMinutes: Math.floor((dbSettings.sync_interval || 30000) / 60000),
+                retryAttempts: dbSettings.max_retries || 3,
+                batchSize: dbSettings.batch_size || 50
+            };
         } catch (error) {
-            console.error('❌ Error getting users:', error);
+            console.error('Error fetching sync settings, using defaults:', error.message);
+            return {
+                autoSync: true,
+                syncIntervalMinutes: 5,
+                retryAttempts: 3,
+                batchSize: 10
+            };
+        }
+    }
+
+    async updateSyncSettings(settings) {
+        try {
+            const dbSettings = {
+                auto_sync: settings.autoSync,
+                auto_sync_enabled: settings.autoSync,
+                sync_interval: settings.syncIntervalMinutes * 60000,
+                max_retries: settings.retryAttempts,
+                batch_size: settings.batchSize,
+                updated_at: new Date().toISOString()
+            };
+
+            const result = await this.makeRequest('/settings', {
+                method: 'PUT',
+                body: JSON.stringify(dbSettings)
+            });
+
+            console.log('✅ Sync settings updated in MySQL database');
+            return result;
+        } catch (error) {
+            console.error('❌ Error updating sync settings:', error);
+            throw error;
+        }
+    }
+
+    // Cache Statistics
+    async getCacheStats() {
+        try {
+            const stats = await this.makeRequest('/cache/stats');
+            return {
+                projects: stats.projects || 0,
+                tasks: stats.tasks || 0,
+                workspaces: stats.workspaces || 0,
+                users: stats.users || 0,
+                storageUsed: stats.storageUsed || 0,
+                lastSync: stats.lastSync || null
+            };
+        } catch (error) {
+            console.error('Error fetching cache stats, returning zeros:', error.message);
+            return {
+                projects: 0,
+                tasks: 0,
+                workspaces: 0,
+                users: 0,
+                storageUsed: 0,
+                lastSync: null
+            };
+        }
+    }
+
+    async clearCache() {
+        try {
+            const result = await this.makeRequest('/cache/clear', {
+                method: 'DELETE'
+            });
+            console.log('✅ Cache cleared from MySQL database');
+            return result;
+        } catch (error) {
+            console.error('❌ Error clearing cache:', error);
+            throw error;
+        }
+    }
+
+    // Sync Queue Management
+    async getSyncQueueStatus() {
+        try {
+            const queueData = await this.makeRequest('/sync-queue/status');
+
+            return {
+                total: (queueData.pending || 0) + (queueData.failed || 0) + (queueData.retry || 0),
+                pending: queueData.pending || 0,
+                failed: queueData.failed || 0,
+                retry: queueData.retry || 0,
+                completed: queueData.completed || 0
+            };
+        } catch (error) {
+            console.error('Error fetching sync queue status, returning zeros:', error.message);
+            return {
+                total: 0,
+                pending: 0,
+                failed: 0,
+                retry: 0,
+                completed: 0
+            };
+        }
+    }
+
+    async clearSyncQueue() {
+        try {
+            const result = await this.makeRequest('/sync-queue/clear-failed', {
+                method: 'DELETE'
+            });
+            console.log('✅ Failed sync queue items cleared from MySQL database');
+            return result;
+        } catch (error) {
+            console.error('❌ Error clearing sync queue:', error);
+            throw error;
+        }
+    }
+
+    async getSyncQueueItems() {
+        try {
+            const items = await this.makeRequest('/sync-queue');
+            return Array.isArray(items) ? items : [];
+        } catch (error) {
+            console.error('Error fetching sync queue items:', error.message);
             return [];
         }
     }
 
-    // Workspaces operations
-    async saveWorkspaces(workspaces) {
-        try {
-            const store = await this.getStore('workspaces', 'readwrite');
-            const promises = workspaces.map(workspace => store.put({ ...workspace, lastUpdated: Date.now() }));
-            await Promise.all(promises);
-            console.log(`✅ Saved ${workspaces.length} workspaces to local database`);
-        } catch (error) {
-            console.error('❌ Error saving workspaces:', error);
-        }
-    }
-
+    // Data Retrieval Methods
     async getWorkspaces() {
         try {
-            const store = await this.getStore('workspaces');
-            const request = store.getAll();
-            return new Promise((resolve, reject) => {
-                request.onsuccess = () => resolve(request.result || []);
-                request.onerror = () => reject(request.error);
-            });
+            const workspaces = await this.makeRequest('/workspaces');
+            return Array.isArray(workspaces) ? workspaces : [];
         } catch (error) {
-            console.error('❌ Error getting workspaces:', error);
+            console.error('Error fetching workspaces from cache:', error.message);
             return [];
         }
     }
 
-    // Projects operations
-    async saveProjects(projects) {
+    async getProjects(workspaceId = null) {
         try {
-            const store = await this.getStore('projects', 'readwrite');
-            const promises = projects.map(project => store.put({ ...project, lastUpdated: Date.now() }));
-            await Promise.all(promises);
-            console.log(`✅ Saved ${projects.length} projects to local database`);
+            const endpoint = workspaceId ? `/workspaces/${workspaceId}/projects` : '/projects';
+            const projects = await this.makeRequest(endpoint);
+            return Array.isArray(projects) ? projects : [];
         } catch (error) {
-            console.error('❌ Error saving projects:', error);
-        }
-    }
-
-    async getProjects() {
-        try {
-            const store = await this.getStore('projects');
-            const request = store.getAll();
-            return new Promise((resolve, reject) => {
-                request.onsuccess = () => resolve(request.result || []);
-                request.onerror = () => reject(request.error);
-            });
-        } catch (error) {
-            console.error('❌ Error getting projects:', error);
+            console.error('Error fetching projects from cache:', error.message);
             return [];
         }
     }
 
-    async getProjectsByWorkspace(workspaceGid) {
+    async getTasks(projectId = null) {
         try {
-            const store = await this.getStore('projects');
-            const index = store.index('workspace');
-            const request = index.getAll(workspaceGid);
-            return new Promise((resolve, reject) => {
-                request.onsuccess = () => resolve(request.result || []);
-                request.onerror = () => reject(request.error);
-            });
+            const endpoint = projectId ? `/projects/${projectId}/tasks` : '/tasks';
+            const tasks = await this.makeRequest(endpoint);
+            return Array.isArray(tasks) ? tasks : [];
         } catch (error) {
-            console.error('❌ Error getting projects by workspace:', error);
+            console.error('Error fetching tasks from cache:', error.message);
             return [];
         }
     }
 
-    // Tasks operations
-    async saveTasks(tasks) {
+    async getUsers(workspaceId = null) {
         try {
-            const store = await this.getStore('tasks', 'readwrite');
-            const promises = tasks.map(task => {
-                // Handle projects array for indexing
-                const taskData = {
-                    ...task,
-                    lastUpdated: Date.now(),
-                    projects: task.projects?.map(p => p.gid) || []
-                };
-                return store.put(taskData);
-            });
-            await Promise.all(promises);
-            console.log(`✅ Saved ${tasks.length} tasks to local database`);
+            const endpoint = workspaceId ? `/workspaces/${workspaceId}/users` : '/users';
+            const users = await this.makeRequest(endpoint);
+            return Array.isArray(users) ? users : [];
         } catch (error) {
-            console.error('❌ Error saving tasks:', error);
-        }
-    }
-
-    async getTasks() {
-        try {
-            const store = await this.getStore('tasks');
-            const request = store.getAll();
-            return new Promise((resolve, reject) => {
-                request.onsuccess = () => resolve(request.result || []);
-                request.onerror = () => reject(request.error);
-            });
-        } catch (error) {
-            console.error('❌ Error getting tasks:', error);
+            console.error('Error fetching users from cache:', error.message);
             return [];
         }
     }
 
-    async getTasksByProject(projectGid) {
+    // Custom Fields Support
+    async getCustomFields(projectId) {
         try {
-            const store = await this.getStore('tasks');
-            const index = store.index('project');
-            const request = index.getAll(projectGid);
-            return new Promise((resolve, reject) => {
-                request.onsuccess = () => resolve(request.result || []);
-                request.onerror = () => reject(request.error);
-            });
+            const customFields = await this.makeRequest(`/projects/${projectId}/custom-fields`);
+            return Array.isArray(customFields) ? customFields : [];
         } catch (error) {
-            console.error('❌ Error getting tasks by project:', error);
+            console.warn('Error fetching custom fields (may not be implemented):', error.message);
             return [];
         }
     }
 
-    async updateTask(taskGid, updates) {
+    // Data Update Methods
+    async updateTask(taskId, taskData) {
         try {
-            const store = await this.getStore('tasks', 'readwrite');
-
-            // Get existing task
-            const getRequest = store.get(taskGid);
-            const existingTask = await new Promise((resolve, reject) => {
-                getRequest.onsuccess = () => resolve(getRequest.result);
-                getRequest.onerror = () => reject(getRequest.error);
+            const result = await this.makeRequest(`/tasks/${taskId}`, {
+                method: 'PUT',
+                body: JSON.stringify(taskData)
             });
-
-            if (existingTask) {
-                const updatedTask = {
-                    ...existingTask,
-                    ...updates,
-                    lastUpdated: Date.now()
-                };
-
-                const putRequest = store.put(updatedTask);
-                await new Promise((resolve, reject) => {
-                    putRequest.onsuccess = () => resolve();
-                    putRequest.onerror = () => reject(putRequest.error);
-                });
-
-                console.log(`✅ Updated task ${taskGid} in local database`);
-                return updatedTask;
-            }
+            console.log(`✅ Task ${taskId} updated in local database`);
+            return result;
         } catch (error) {
-            console.error('❌ Error updating task:', error);
+            console.error(`❌ Error updating task ${taskId}:`, error);
+            throw error;
         }
     }
 
-    // Sync queue operations
-    async addToSyncQueue(operation) {
+    async updateProject(projectId, projectData) {
         try {
-            const syncItem = {
-                ...operation,
-                timestamp: Date.now(),
-                status: 'pending',
-                retryCount: 0,
-                priority: operation.priority || 'medium'
-            };
-
-            const store = await this.getStore('syncQueue', 'readwrite');
-            const request = store.add(syncItem);
-
-            await new Promise((resolve, reject) => {
-                request.onsuccess = () => resolve();
-                request.onerror = () => reject(request.error);
+            const result = await this.makeRequest(`/projects/${projectId}`, {
+                method: 'PUT',
+                body: JSON.stringify(projectData)
             });
-
-            console.log(`✅ Added operation to sync queue:`, operation.type);
+            console.log(`✅ Project ${projectId} updated in local database`);
+            return result;
         } catch (error) {
-            console.error('❌ Error adding to sync queue:', error);
+            console.error(`❌ Error updating project ${projectId}:`, error);
+            throw error;
         }
     }
 
-    async getSyncQueue() {
+    async createTask(taskData) {
         try {
-            const store = await this.getStore('syncQueue');
-            const request = store.getAll();
-            return new Promise((resolve, reject) => {
-                request.onsuccess = () => resolve(request.result || []);
-                request.onerror = () => reject(request.error);
+            const result = await this.makeRequest('/tasks', {
+                method: 'POST',
+                body: JSON.stringify(taskData)
             });
+            console.log('✅ Task created in local database');
+            return result;
         } catch (error) {
-            console.error('❌ Error getting sync queue:', error);
-            return [];
+            console.error('❌ Error creating task:', error);
+            throw error;
         }
     }
 
-    async updateSyncQueueItem(id, updates) {
+    async createProject(projectData) {
         try {
-            const store = await this.getStore('syncQueue', 'readwrite');
-
-            const getRequest = store.get(id);
-            const existingItem = await new Promise((resolve, reject) => {
-                getRequest.onsuccess = () => resolve(getRequest.result);
-                getRequest.onerror = () => reject(getRequest.error);
+            const result = await this.makeRequest('/projects', {
+                method: 'POST',
+                body: JSON.stringify(projectData)
             });
-
-            if (existingItem) {
-                const updatedItem = { ...existingItem, ...updates };
-                const putRequest = store.put(updatedItem);
-                await new Promise((resolve, reject) => {
-                    putRequest.onsuccess = () => resolve();
-                    putRequest.onerror = () => reject(putRequest.error);
-                });
-            }
+            console.log('✅ Project created in local database');
+            return result;
         } catch (error) {
-            console.error('❌ Error updating sync queue item:', error);
+            console.error('❌ Error creating project:', error);
+            throw error;
         }
     }
 
-    async deleteSyncQueueItem(id) {
+    async deleteTask(taskId) {
         try {
-            const store = await this.getStore('syncQueue', 'readwrite');
-            const request = store.delete(id);
-            await new Promise((resolve, reject) => {
-                request.onsuccess = () => resolve();
-                request.onerror = () => reject(request.error);
+            const result = await this.makeRequest(`/tasks/${taskId}`, {
+                method: 'DELETE'
             });
+            console.log(`✅ Task ${taskId} deleted from local database`);
+            return result;
         } catch (error) {
-            console.error('❌ Error deleting sync queue item:', error);
+            console.error(`❌ Error deleting task ${taskId}:`, error);
+            throw error;
         }
     }
 
-    // Settings operations
-    async saveSetting(key, value) {
+    async deleteProject(projectId) {
         try {
-            const store = await this.getStore('settings', 'readwrite');
-            const request = store.put({ key, value, lastUpdated: Date.now() });
-            await new Promise((resolve, reject) => {
-                request.onsuccess = () => resolve();
-                request.onerror = () => reject(request.error);
+            const result = await this.makeRequest(`/projects/${projectId}`, {
+                method: 'DELETE'
             });
+            console.log(`✅ Project ${projectId} deleted from local database`);
+            return result;
         } catch (error) {
-            console.error('❌ Error saving setting:', error);
+            console.error(`❌ Error deleting project ${projectId}:`, error);
+            throw error;
         }
     }
 
-    async getSetting(key, defaultValue = null) {
+    // Sync Operations
+    async triggerSync() {
         try {
-            const store = await this.getStore('settings');
-            const request = store.get(key);
-            return new Promise((resolve, reject) => {
-                request.onsuccess = () => {
-                    const result = request.result;
-                    resolve(result ? result.value : defaultValue);
-                };
-                request.onerror = () => reject(request.error);
+            const result = await this.makeRequest('/sync/trigger', {
+                method: 'POST'
             });
+            console.log('✅ Sync operation triggered');
+            return result;
         } catch (error) {
-            console.error('❌ Error getting setting:', error);
-            return defaultValue;
+            console.error('❌ Error triggering sync:', error);
+            throw error;
         }
     }
 
-    // Utility operations
-    async clearAllData() {
+    async processSyncQueue() {
         try {
-            await this.init();
-            const stores = ['users', 'workspaces', 'projects', 'tasks', 'syncQueue', 'settings'];
-
-            for (const storeName of stores) {
-                const store = await this.getStore(storeName, 'readwrite');
-                await new Promise((resolve, reject) => {
-                    const request = store.clear();
-                    request.onsuccess = () => resolve();
-                    request.onerror = () => reject(request.error);
-                });
-            }
-
-            console.log('✅ Cleared all local database data');
+            const result = await this.makeRequest('/sync/process', {
+                method: 'POST'
+            });
+            console.log('✅ Sync queue processing completed');
+            return result;
         } catch (error) {
-            console.error('❌ Error clearing all data:', error);
+            console.error('❌ Error processing sync queue:', error);
+            throw error;
         }
     }
 
-    async getStorageInfo() {
+    async pullAllDataFromAsana() {
         try {
-            const stores = ['users', 'workspaces', 'projects', 'tasks', 'syncQueue', 'settings'];
-            const info = {};
+            const result = await this.makeRequest('/sync/all', {
+                method: 'POST'
+            });
+            console.log('✅ Full data pull from Asana completed');
+            return result;
+        } catch (error) {
+            console.error('❌ Error pulling all data from Asana:', error);
+            throw error;
+        }
+    }
 
-            for (const storeName of stores) {
-                const store = await this.getStore(storeName);
-                const request = store.count();
-                info[storeName] = await new Promise((resolve, reject) => {
-                    request.onsuccess = () => resolve(request.result);
-                    request.onerror = () => reject(request.error);
-                });
-            }
+    // Utility Methods
+    async testConnection() {
+        try {
+            const result = await this.makeRequest('/test-connection');
+            console.log('✅ Database connection test passed');
+            return { success: true, ...result };
+        } catch (error) {
+            console.error('❌ Database connection test failed:', error);
+            return { success: false, error: error.message };
+        }
+    }
 
+    async getServerInfo() {
+        try {
+            const info = await this.makeRequest('/info');
             return info;
         } catch (error) {
-            console.error('❌ Error getting storage info:', error);
-            return {};
+            console.error('Error fetching server info:', error.message);
+            return { version: 'unknown', status: 'error' };
         }
+    }
+
+    // Batch operations for efficiency
+    async batchUpdateTasks(taskUpdates) {
+        try {
+            const result = await this.makeRequest('/tasks/batch', {
+                method: 'PUT',
+                body: JSON.stringify({ tasks: taskUpdates })
+            });
+            console.log(`✅ Batch updated ${taskUpdates.length} tasks`);
+            return result;
+        } catch (error) {
+            console.error('❌ Error in batch task update:', error);
+            throw error;
+        }
+    }
+
+    async batchCreateTasks(tasks) {
+        try {
+            const result = await this.makeRequest('/tasks/batch', {
+                method: 'POST',
+                body: JSON.stringify({ tasks })
+            });
+            console.log(`✅ Batch created ${tasks.length} tasks`);
+            return result;
+        } catch (error) {
+            console.error('❌ Error in batch task creation:', error);
+            throw error;
+        }
+    }
+
+    // Connection status getter
+    get connectionStatus() {
+        return this.isConnected;
+    }
+
+    // Force refresh connection status
+    async refreshConnectionStatus() {
+        this.lastHealthCheck = null; // Clear cache
+        return await this.isAvailable();
     }
 }
 
-// Create and export a singleton instance
+// Export singleton instance
 export const localDB = new LocalDatabase();
+export default LocalDatabase;
