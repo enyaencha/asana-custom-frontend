@@ -539,7 +539,7 @@ app.get('/api/workspaces/:workspaceId/projects', async (req, res) => {
 });
 
 // Get tasks for project
-app.get('/api/projects/:projectId/tasks', async (req, res) => {
+app.get('/api/projects/:projectId/tasks/active', async (req, res) => {
     try {
         const { projectId } = req.params;
 
@@ -548,11 +548,12 @@ app.get('/api/projects/:projectId/tasks', async (req, res) => {
             FROM tasks t
             LEFT JOIN users u ON t.assignee_gid = u.gid
             INNER JOIN task_projects tp ON t.gid = tp.task_gid
-            WHERE tp.project_gid = ?
+            WHERE tp.project_gid = ? 
+              AND t.sync_status NOT IN ('voided', 'deleted')
             ORDER BY t.created_at DESC
         `, [projectId]);
 
-        const tasksWithProjects = rows.map(task => ({
+        const activeTasks = rows.map(task => ({
             ...task,
             assignee: task.assignee_gid ? {
                 gid: task.assignee_gid,
@@ -564,13 +565,128 @@ app.get('/api/projects/:projectId/tasks', async (req, res) => {
             asana_data: JsonUtils.safeParse(task.asana_data, {})
         }));
 
-        res.json({ data: tasksWithProjects });
+        res.json({
+            data: activeTasks,
+            count: activeTasks.length,
+            excluded_statuses: ['voided', 'deleted']
+        });
 
     } catch (error) {
-        console.error('❌ Error fetching tasks:', error);
+        console.error('❌ Error fetching active tasks:', error);
         res.status(500).json({ error: error.message });
     }
 });
+// Get all tasks including voided/deleted (for admin view)
+app.get('/api/projects/:projectId/tasks/all', async (req, res) => {
+    try {
+        const { projectId } = req.params;
+
+        const [rows] = await pool.execute(`
+            SELECT t.*, u.name as assignee_name, u.email as assignee_email
+            FROM tasks t
+            LEFT JOIN users u ON t.assignee_gid = u.gid
+            INNER JOIN task_projects tp ON t.gid = tp.task_gid
+            WHERE tp.project_gid = ?
+            ORDER BY 
+                CASE t.sync_status 
+                    WHEN 'voided' THEN 3
+                    WHEN 'deleted' THEN 4
+                    ELSE 1 
+                END,
+                t.created_at DESC
+        `, [projectId]);
+
+        const allTasks = rows.map(task => ({
+            ...task,
+            assignee: task.assignee_gid ? {
+                gid: task.assignee_gid,
+                name: task.assignee_name,
+                email: task.assignee_email
+            } : null,
+            projects: [{ gid: projectId }],
+            custom_fields: JsonUtils.safeParse(task.custom_fields, []),
+            asana_data: JsonUtils.safeParse(task.asana_data, {})
+        }));
+
+        // Group by status for easier viewing
+        const grouped = {
+            active: allTasks.filter(t => !['voided', 'deleted'].includes(t.sync_status)),
+            voided: allTasks.filter(t => t.sync_status === 'voided'),
+            deleted: allTasks.filter(t => t.sync_status === 'deleted')
+        };
+
+        res.json({
+            data: allTasks,
+            grouped,
+            counts: {
+                active: grouped.active.length,
+                voided: grouped.voided.length,
+                deleted: grouped.deleted.length,
+                total: allTasks.length
+            }
+        });
+
+    } catch (error) {
+        console.error('❌ Error fetching all tasks:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Status summary endpoint
+app.get('/api/status/summary', async (req, res) => {
+    try {
+        const [taskStats] = await pool.execute(`
+            SELECT 
+                sync_status,
+                COUNT(*) as count
+            FROM tasks 
+            GROUP BY sync_status
+            ORDER BY 
+                CASE sync_status 
+                    WHEN 'synced' THEN 1
+                    WHEN 'pending' THEN 2
+                    WHEN 'voided' THEN 3
+                    WHEN 'deleted' THEN 4
+                    ELSE 5
+                END
+        `);
+
+        const [projectStats] = await pool.execute(`
+            SELECT 
+                sync_status,
+                COUNT(*) as count
+            FROM projects 
+            GROUP BY sync_status
+            ORDER BY 
+                CASE sync_status 
+                    WHEN 'synced' THEN 1
+                    WHEN 'pending' THEN 2
+                    WHEN 'voided' THEN 3
+                    WHEN 'deleted' THEN 4
+                    ELSE 5
+                END
+        `);
+
+        res.json({
+            message: 'Database status summary',
+            tasks: taskStats,
+            projects: projectStats,
+            explanation: {
+                'synced': 'Successfully synced with Asana server',
+                'pending': 'Waiting to sync with Asana server',
+                'voided': 'Deleted locally, queued for server deletion',
+                'deleted': 'Deleted from Asana server, kept locally for audit'
+            }
+        });
+
+    } catch (error) {
+        console.error('❌ Status summary failed:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+console.log('🗑️ Soft delete operations configured - items marked as "voided" locally, "deleted" after server sync');
+
 
 // Create project
 app.post('/api/projects', async (req, res) => {
@@ -1589,6 +1705,1045 @@ app.post('/api/debug/manual-sync/:itemId', async (req, res) => {
         res.status(500).json({ error: error.message });
     }
 });
+
+
+
+
+
+
+
+
+
+
+// FIXED SOFT DELETE OPERATIONS
+// Replace your DELETE endpoints and sync processing with these versions
+
+// =============================================================================
+// UPDATED DELETE ENDPOINTS - SOFT DELETE WITH 'VOIDED' STATUS
+// =============================================================================
+
+// DELETE TASK - Soft delete with 'voided' status
+app.delete('/api/tasks/:taskId', async (req, res) => {
+    try {
+        const { taskId } = req.params;
+
+        console.log(`🗑️ SOFT DELETE TASK: ${taskId}`);
+
+        // Check if task exists
+        const [existingTask] = await pool.execute('SELECT * FROM tasks WHERE gid = ?', [taskId]);
+
+        if (existingTask.length === 0) {
+            return res.status(404).json({ error: 'Task not found' });
+        }
+
+        const task = existingTask[0];
+
+        // For local IDs that were never synced, we can hard delete
+        if (taskId.startsWith('local_')) {
+            // Hard delete for local-only tasks
+            await pool.execute('DELETE FROM custom_field_values WHERE task_gid = ?', [taskId]);
+            await pool.execute('DELETE FROM task_projects WHERE task_gid = ?', [taskId]);
+            await pool.execute('DELETE FROM tasks WHERE gid = ?', [taskId]);
+
+            console.log(`✅ Local-only task ${taskId} deleted completely`);
+
+            return res.json({
+                message: 'Local task deleted successfully',
+                data: { gid: taskId, deleted_locally: true, hard_deleted: true }
+            });
+        }
+
+        // For synced tasks, use soft delete with 'voided' status
+        await pool.execute(`
+            UPDATE tasks 
+            SET sync_status = 'voided', updated_at = CURRENT_TIMESTAMP 
+            WHERE gid = ?
+        `, [taskId]);
+
+        // Queue for sync deletion on Asana server
+        await pool.execute(`
+            INSERT IGNORE INTO sync_queue (operation_type, resource_type, resource_id, payload, priority)
+            VALUES ('DELETE', 'task', ?, '{}', 'high')
+        `, [taskId]);
+
+        console.log(`✅ Task ${taskId} marked as 'voided' locally, queued for server deletion`);
+        triggerAutoSync('delete');
+
+        res.json({
+            message: 'Task marked as voided locally, deletion queued for server',
+            data: {
+                gid: taskId,
+                name: task.name,
+                sync_status: 'voided',
+                deleted_from_server: 'pending',
+                kept_locally: true
+            }
+        });
+
+    } catch (error) {
+        console.error('❌ Task soft deletion failed:', error);
+        res.status(500).json({
+            error: 'Task deletion failed',
+            message: error.message
+        });
+    }
+});
+
+// DELETE PROJECT - Soft delete with 'voided' status
+app.delete('/api/projects/:projectId', async (req, res) => {
+    try {
+        const { projectId } = req.params;
+
+        console.log(`🗑️ SOFT DELETE PROJECT: ${projectId}`);
+
+        // Check if project exists
+        const [existingProject] = await pool.execute('SELECT * FROM projects WHERE gid = ?', [projectId]);
+
+        if (existingProject.length === 0) {
+            return res.status(404).json({ error: 'Project not found' });
+        }
+
+        const project = existingProject[0];
+
+        // Check for active tasks in this project (not voided)
+        const [activeTasks] = await pool.execute(`
+            SELECT COUNT(*) as count 
+            FROM tasks t
+            JOIN task_projects tp ON t.gid = tp.task_gid
+            WHERE tp.project_gid = ? AND t.sync_status != 'voided'
+        `, [projectId]);
+
+        if (activeTasks[0].count > 0) {
+            return res.status(400).json({
+                error: 'Cannot delete project with active tasks',
+                active_task_count: activeTasks[0].count,
+                suggestion: 'Delete or move all tasks first, or use force=true parameter'
+            });
+        }
+
+        // For local IDs that were never synced, we can hard delete
+        if (projectId.startsWith('local_')) {
+            // Hard delete for local-only projects
+            await pool.execute('DELETE FROM task_projects WHERE project_gid = ?', [projectId]);
+            await pool.execute('DELETE FROM projects WHERE gid = ?', [projectId]);
+
+            console.log(`✅ Local-only project ${projectId} deleted completely`);
+
+            return res.json({
+                message: 'Local project deleted successfully',
+                data: { gid: projectId, deleted_locally: true, hard_deleted: true }
+            });
+        }
+
+        // For synced projects, use soft delete with 'voided' status
+        await pool.execute(`
+            UPDATE projects 
+            SET sync_status = 'voided', updated_at = CURRENT_TIMESTAMP 
+            WHERE gid = ?
+        `, [projectId]);
+
+        // Queue for sync deletion on Asana server
+        await pool.execute(`
+            INSERT IGNORE INTO sync_queue (operation_type, resource_type, resource_id, payload, priority)
+            VALUES ('DELETE', 'project', ?, '{}', 'high')
+        `, [projectId]);
+
+        console.log(`✅ Project ${projectId} marked as 'voided' locally, queued for server deletion`);
+        triggerAutoSync('delete');
+
+        res.json({
+            message: 'Project marked as voided locally, deletion queued for server',
+            data: {
+                gid: projectId,
+                name: project.name,
+                sync_status: 'voided',
+                deleted_from_server: 'pending',
+                kept_locally: true
+            }
+        });
+
+    } catch (error) {
+        console.error('❌ Project soft deletion failed:', error);
+        res.status(500).json({
+            error: 'Project deletion failed',
+            message: error.message
+        });
+    }
+});
+
+// =============================================================================
+// FORCE DELETE ENDPOINTS (Optional - for admin use)
+// =============================================================================
+
+// Force delete project (with active tasks)
+app.delete('/api/projects/:projectId/force', async (req, res) => {
+    try {
+        const { projectId } = req.params;
+
+        console.log(`💥 FORCE DELETE PROJECT: ${projectId}`);
+
+        // Check if project exists
+        const [existingProject] = await pool.execute('SELECT * FROM projects WHERE gid = ?', [projectId]);
+
+        if (existingProject.length === 0) {
+            return res.status(404).json({ error: 'Project not found' });
+        }
+
+        const project = existingProject[0];
+
+        // Get all tasks in this project
+        const [projectTasks] = await pool.execute(`
+            SELECT t.gid, t.name 
+            FROM tasks t
+            JOIN task_projects tp ON t.gid = tp.task_gid
+            WHERE tp.project_gid = ?
+        `, [projectId]);
+
+        // Mark all tasks in project as voided too
+        if (projectTasks.length > 0) {
+            await pool.execute(`
+                UPDATE tasks t
+                JOIN task_projects tp ON t.gid = tp.task_gid
+                SET t.sync_status = 'voided', t.updated_at = CURRENT_TIMESTAMP
+                WHERE tp.project_gid = ? AND t.sync_status != 'voided'
+            `, [projectId]);
+
+            // Queue all tasks for deletion
+            for (const task of projectTasks) {
+                if (!task.gid.startsWith('local_')) {
+                    await pool.execute(`
+                        INSERT IGNORE INTO sync_queue (operation_type, resource_type, resource_id, payload, priority)
+                        VALUES ('DELETE', 'task', ?, '{}', 'high')
+                    `, [task.gid]);
+                }
+            }
+
+            console.log(`📝 Marked ${projectTasks.length} tasks as voided`);
+        }
+
+        // Mark project as voided
+        await pool.execute(`
+            UPDATE projects 
+            SET sync_status = 'voided', updated_at = CURRENT_TIMESTAMP 
+            WHERE gid = ?
+        `, [projectId]);
+
+        // Queue project for deletion if not local
+        if (!projectId.startsWith('local_')) {
+            await pool.execute(`
+                INSERT IGNORE INTO sync_queue (operation_type, resource_type, resource_id, payload, priority)
+                VALUES ('DELETE', 'project', ?, '{}', 'high')
+            `, [projectId]);
+        }
+
+        console.log(`✅ Project ${projectId} and ${projectTasks.length} tasks force-deleted (voided)`);
+        triggerAutoSync('delete');
+
+        res.json({
+            message: 'Project and all tasks marked as voided (force delete)',
+            data: {
+                gid: projectId,
+                name: project.name,
+                sync_status: 'voided',
+                tasks_affected: projectTasks.length,
+                task_names: projectTasks.map(t => t.name)
+            }
+        });
+
+    } catch (error) {
+        console.error('❌ Project force deletion failed:', error);
+        res.status(500).json({
+            error: 'Force deletion failed',
+            message: error.message
+        });
+    }
+});
+
+// =============================================================================
+// UPDATED SYNC PROCESSING - KEEP LOCAL RECORDS AS 'VOIDED'
+// =============================================================================
+
+// Updated processSyncItemEnhancedFixed to handle soft deletes properly
+async function processSyncItemSoftDelete(item) {
+    const { operation_type, resource_type, resource_id, payload } = item;
+
+    console.log(`🔄 Processing ${operation_type} for ${resource_type} ${resource_id}`);
+
+    // Block local IDs from UPDATE/DELETE operations
+    if (resource_id.startsWith('local_') && ['UPDATE', 'DELETE'].includes(operation_type)) {
+        console.log(`⚠️ BLOCKING: Cannot ${operation_type} local ID ${resource_id} on server`);
+        return { error: 'Local ID cannot be synced to server', skipped: true };
+    }
+
+    const parsedPayload = JsonUtils.safeParse(payload, {});
+
+    try {
+        switch (operation_type) {
+            case 'CREATE':
+                const createEndpoint = `${MAIN_SERVER_URL}/${resource_type}s`;
+                console.log(`🏗️ Creating ${resource_type} at: ${createEndpoint}`);
+
+                const createResponse = await axios.post(createEndpoint, parsedPayload, {
+                    timeout: 30000,
+                    headers: { 'Content-Type': 'application/json' }
+                });
+
+                const createdResource = createResponse.data.data || createResponse.data;
+                if (!createdResource || !createdResource.gid) {
+                    throw new Error('Server did not return valid resource data');
+                }
+
+                console.log(`✅ ${resource_type} created with GID: ${createdResource.gid}`);
+
+                // Update local record with real GID
+                const connection = await pool.getConnection();
+                await connection.beginTransaction();
+
+                try {
+                    await connection.execute(
+                        `UPDATE ${resource_type}s SET gid = ?, sync_status = 'synced' WHERE gid = ?`,
+                        [createdResource.gid, resource_id]
+                    );
+
+                    // Update relationships
+                    if (resource_type === 'project') {
+                        await connection.execute(
+                            'UPDATE task_projects SET project_gid = ? WHERE project_gid = ?',
+                            [createdResource.gid, resource_id]
+                        );
+                    } else if (resource_type === 'task') {
+                        await connection.execute(
+                            'UPDATE task_projects SET task_gid = ? WHERE task_gid = ?',
+                            [createdResource.gid, resource_id]
+                        );
+                        await connection.execute(
+                            'UPDATE custom_field_values SET task_gid = ? WHERE task_gid = ?',
+                            [createdResource.gid, resource_id]
+                        );
+                    }
+
+                    await connection.commit();
+                    console.log(`✅ Local ${resource_type} updated: ${resource_id} → ${createdResource.gid}`);
+                } catch (dbError) {
+                    await connection.rollback();
+                    throw new Error(`Database update failed: ${dbError.message}`);
+                } finally {
+                    connection.release();
+                }
+
+                return { success: true, oldGid: resource_id, newGid: createdResource.gid };
+
+            case 'UPDATE':
+                const updateEndpoint = `${MAIN_SERVER_URL}/${resource_type}s/${resource_id}`;
+                console.log(`📝 Updating ${resource_type} at: ${updateEndpoint}`);
+
+                const updateResponse = await axios.put(updateEndpoint, parsedPayload, {
+                    timeout: 30000,
+                    headers: { 'Content-Type': 'application/json' }
+                });
+
+                console.log(`✅ ${resource_type} ${resource_id} updated on server`);
+
+                // Update local sync status
+                await pool.execute(
+                    `UPDATE ${resource_type}s SET sync_status = 'synced', updated_at = CURRENT_TIMESTAMP WHERE gid = ?`,
+                    [resource_id]
+                );
+
+                return { success: true, updated: true };
+
+            case 'DELETE':
+                const deleteEndpoint = `${MAIN_SERVER_URL}/${resource_type}s/${resource_id}`;
+                console.log(`🗑️ Deleting ${resource_type} from server at: ${deleteEndpoint}`);
+
+                await axios.delete(deleteEndpoint, { timeout: 30000 });
+                console.log(`✅ ${resource_type} ${resource_id} deleted from Asana server`);
+
+                // IMPORTANT: Keep local record but mark as 'deleted' instead of removing
+                await pool.execute(
+                    `UPDATE ${resource_type}s SET sync_status = 'deleted', updated_at = CURRENT_TIMESTAMP WHERE gid = ?`,
+                    [resource_id]
+                );
+
+                console.log(`📝 Local ${resource_type} ${resource_id} marked as 'deleted' (kept for audit trail)`);
+
+                return { success: true, deleted: true, kept_locally: true };
+
+            default:
+                throw new Error(`Unknown operation type: ${operation_type}`);
+        }
+
+    } catch (error) {
+        console.error(`❌ Sync operation failed for ${operation_type} ${resource_type} ${resource_id}:`);
+        console.error('Error details:', error.message);
+
+        if (error.response) {
+            console.error('Response status:', error.response.status);
+            console.error('Response data:', error.response.data);
+        }
+
+        throw error;
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// UPDATE TASK - Local first, then sync
+app.put('/api/tasks/:taskId', async (req, res) => {
+    try {
+        const { taskId } = req.params;
+        const updates = req.body;
+
+        console.log(`📝 LOCAL UPDATE: Task ${taskId} with data:`, updates);
+
+        // Build dynamic update query
+        const allowedFields = ['name', 'notes', 'completed', 'assignee_gid', 'due_date', 'priority', 'progress'];
+        const updateFields = [];
+        const updateValues = [];
+
+        allowedFields.forEach(field => {
+            if (updates[field] !== undefined) {
+                updateFields.push(`${field} = ?`);
+                updateValues.push(updates[field]);
+            }
+        });
+
+        // Handle custom fields separately
+        if (updates.custom_fields) {
+            updateFields.push('custom_fields = ?');
+            updateValues.push(JsonUtils.ensureJsonString(updates.custom_fields));
+        }
+
+        if (updateFields.length === 0) {
+            return res.status(400).json({ error: 'No valid fields to update' });
+        }
+
+        // Always update sync status and timestamp
+        updateFields.push('updated_at = CURRENT_TIMESTAMP', 'sync_status = ?');
+        updateValues.push('pending');
+        updateValues.push(taskId);
+
+        // Execute local update
+        const [updateResult] = await pool.execute(`
+            UPDATE tasks 
+            SET ${updateFields.join(', ')} 
+            WHERE gid = ?
+        `, updateValues);
+
+        if (updateResult.affectedRows === 0) {
+            return res.status(404).json({ error: 'Task not found' });
+        }
+
+        // Get updated task for response
+        const [updatedTask] = await pool.execute(`
+            SELECT t.*, u.name as assignee_name, u.email as assignee_email
+            FROM tasks t
+            LEFT JOIN users u ON t.assignee_gid = u.gid
+            WHERE t.gid = ?
+        `, [taskId]);
+
+        const task = updatedTask[0];
+
+        // Queue for sync - IMPORTANT: Clean payload
+        const syncPayload = {};
+        allowedFields.forEach(field => {
+            if (updates[field] !== undefined) {
+                syncPayload[field] = updates[field];
+            }
+        });
+
+        if (updates.custom_fields) {
+            syncPayload.custom_fields = updates.custom_fields;
+        }
+
+        await pool.execute(`
+            INSERT IGNORE INTO sync_queue (operation_type, resource_type, resource_id, payload, priority)
+            VALUES ('UPDATE', 'task', ?, ?, 'medium')
+        `, [taskId, JsonUtils.ensureJsonString(syncPayload)]);
+
+        console.log(`✅ Task ${taskId} updated locally, queued for sync`);
+
+        // Trigger auto-sync
+        triggerAutoSync('update');
+
+        res.json({
+            data: {
+                ...task,
+                assignee: task.assignee_gid ? {
+                    gid: task.assignee_gid,
+                    name: task.assignee_name,
+                    email: task.assignee_email
+                } : null,
+                custom_fields: JsonUtils.safeParse(task.custom_fields, []),
+                updated_locally: true
+            }
+        });
+
+    } catch (error) {
+        console.error('❌ Task update failed:', error);
+        res.status(500).json({
+            error: 'Task update failed',
+            message: error.message
+        });
+    }
+});
+
+// UPDATE PROJECT - Local first, then sync
+app.put('/api/projects/:projectId', async (req, res) => {
+    try {
+        const { projectId } = req.params;
+        const updates = req.body;
+
+        console.log(`📝 LOCAL UPDATE: Project ${projectId} with data:`, updates);
+
+        const allowedFields = ['name', 'notes', 'color', 'archived'];
+        const updateFields = [];
+        const updateValues = [];
+
+        allowedFields.forEach(field => {
+            if (updates[field] !== undefined) {
+                updateFields.push(`${field} = ?`);
+                updateValues.push(updates[field]);
+            }
+        });
+
+        // Handle 'public' field separately (it's a reserved word)
+        if (updates.public !== undefined) {
+            updateFields.push('`public` = ?');
+            updateValues.push(updates.public);
+        }
+
+        if (updateFields.length === 0) {
+            return res.status(400).json({ error: 'No valid fields to update' });
+        }
+
+        updateFields.push('updated_at = CURRENT_TIMESTAMP', 'sync_status = ?');
+        updateValues.push('pending');
+        updateValues.push(projectId);
+
+        const [updateResult] = await pool.execute(`
+            UPDATE projects 
+            SET ${updateFields.join(', ')} 
+            WHERE gid = ?
+        `, updateValues);
+
+        if (updateResult.affectedRows === 0) {
+            return res.status(404).json({ error: 'Project not found' });
+        }
+
+        // Get updated project
+        const [updatedProject] = await pool.execute('SELECT * FROM projects WHERE gid = ?', [projectId]);
+
+        // Queue for sync
+        const syncPayload = {};
+        allowedFields.forEach(field => {
+            if (updates[field] !== undefined) {
+                syncPayload[field] = updates[field];
+            }
+        });
+        if (updates.public !== undefined) {
+            syncPayload.public = updates.public;
+        }
+
+        await pool.execute(`
+            INSERT IGNORE INTO sync_queue (operation_type, resource_type, resource_id, payload, priority)
+            VALUES ('UPDATE', 'project', ?, ?, 'medium')
+        `, [projectId, JsonUtils.ensureJsonString(syncPayload)]);
+
+        console.log(`✅ Project ${projectId} updated locally, queued for sync`);
+        triggerAutoSync('update');
+
+        res.json({
+            data: {
+                ...updatedProject[0],
+                updated_locally: true
+            }
+        });
+
+    } catch (error) {
+        console.error('❌ Project update failed:', error);
+        res.status(500).json({
+            error: 'Project update failed',
+            message: error.message
+        });
+    }
+});
+
+
+
+// =============================================================================
+// FIXED SYNC PROCESSING - Replace your processSyncItemEnhanced function
+// =============================================================================
+
+async function processSyncItemEnhancedFixed(item) {
+    const { operation_type, resource_type, resource_id, payload } = item;
+
+    console.log(`🔄 Processing ${operation_type} for ${resource_type} ${resource_id}`);
+
+    // Block local IDs from UPDATE/DELETE operations
+    if (resource_id.startsWith('local_') && ['UPDATE', 'DELETE'].includes(operation_type)) {
+        console.log(`⚠️ BLOCKING: Cannot ${operation_type} local ID ${resource_id}`);
+        return { error: 'Local ID cannot be updated/deleted on server', skipped: true };
+    }
+
+    const parsedPayload = JsonUtils.safeParse(payload, {});
+
+    try {
+        switch (operation_type) {
+            case 'CREATE':
+                const createEndpoint = `${MAIN_SERVER_URL}/${resource_type}s`;
+                console.log(`🏗️ Creating ${resource_type} at: ${createEndpoint}`);
+                console.log(`📤 Payload:`, parsedPayload);
+
+                const createResponse = await axios.post(createEndpoint, parsedPayload, {
+                    timeout: 30000,
+                    headers: { 'Content-Type': 'application/json' }
+                });
+
+                const createdResource = createResponse.data.data || createResponse.data;
+                if (!createdResource || !createdResource.gid) {
+                    throw new Error('Server did not return valid resource data');
+                }
+
+                console.log(`✅ ${resource_type} created with GID: ${createdResource.gid}`);
+
+                // Update local record with real GID
+                const connection = await pool.getConnection();
+                await connection.beginTransaction();
+
+                try {
+                    // Update main table
+                    await connection.execute(
+                        `UPDATE ${resource_type}s SET gid = ?, sync_status = 'synced' WHERE gid = ?`,
+                        [createdResource.gid, resource_id]
+                    );
+
+                    // Update relationships
+                    if (resource_type === 'project') {
+                        await connection.execute(
+                            'UPDATE task_projects SET project_gid = ? WHERE project_gid = ?',
+                            [createdResource.gid, resource_id]
+                        );
+                    } else if (resource_type === 'task') {
+                        await connection.execute(
+                            'UPDATE task_projects SET task_gid = ? WHERE task_gid = ?',
+                            [createdResource.gid, resource_id]
+                        );
+                        await connection.execute(
+                            'UPDATE custom_field_values SET task_gid = ? WHERE task_gid = ?',
+                            [createdResource.gid, resource_id]
+                        );
+                    }
+
+                    await connection.commit();
+                    console.log(`✅ Local ${resource_type} updated: ${resource_id} → ${createdResource.gid}`);
+                } catch (dbError) {
+                    await connection.rollback();
+                    throw new Error(`Database update failed: ${dbError.message}`);
+                } finally {
+                    connection.release();
+                }
+
+                return { success: true, oldGid: resource_id, newGid: createdResource.gid };
+
+            case 'UPDATE':
+                // FIXED: Correct endpoint path for updates
+                const updateEndpoint = `${MAIN_SERVER_URL}/${resource_type}s/${resource_id}`;
+                console.log(`📝 Updating ${resource_type} at: ${updateEndpoint}`);
+                console.log(`📤 Update payload:`, parsedPayload);
+
+                const updateResponse = await axios.put(updateEndpoint, parsedPayload, {
+                    timeout: 30000,
+                    headers: { 'Content-Type': 'application/json' }
+                });
+
+                console.log(`✅ ${resource_type} ${resource_id} updated on server`);
+
+                // Update local sync status
+                await pool.execute(
+                    `UPDATE ${resource_type}s SET sync_status = 'synced', updated_at = CURRENT_TIMESTAMP WHERE gid = ?`,
+                    [resource_id]
+                );
+
+                return { success: true, updated: true };
+
+            case 'DELETE':
+                // FIXED: Correct endpoint path for deletes
+                const deleteEndpoint = `${MAIN_SERVER_URL}/${resource_type}s/${resource_id}`;
+                console.log(`🗑️ Deleting ${resource_type} at: ${deleteEndpoint}`);
+
+                await axios.delete(deleteEndpoint, { timeout: 30000 });
+                console.log(`✅ ${resource_type} ${resource_id} deleted from server`);
+
+                // Remove from local database after successful server deletion
+                const deleteConnection = await pool.getConnection();
+                await deleteConnection.beginTransaction();
+
+                try {
+                    if (resource_type === 'task') {
+                        await deleteConnection.execute('DELETE FROM custom_field_values WHERE task_gid = ?', [resource_id]);
+                        await deleteConnection.execute('DELETE FROM task_projects WHERE task_gid = ?', [resource_id]);
+                        await deleteConnection.execute('DELETE FROM tasks WHERE gid = ?', [resource_id]);
+                    } else if (resource_type === 'project') {
+                        await deleteConnection.execute('DELETE FROM task_projects WHERE project_gid = ?', [resource_id]);
+                        await deleteConnection.execute('DELETE FROM projects WHERE gid = ?', [resource_id]);
+                    }
+
+                    await deleteConnection.commit();
+                    console.log(`✅ ${resource_type} ${resource_id} removed from local database`);
+                } catch (dbError) {
+                    await deleteConnection.rollback();
+                    throw new Error(`Local deletion failed: ${dbError.message}`);
+                } finally {
+                    deleteConnection.release();
+                }
+
+                return { success: true, deleted: true };
+
+            default:
+                throw new Error(`Unknown operation type: ${operation_type}`);
+        }
+
+    } catch (error) {
+        console.error(`❌ Sync operation failed for ${operation_type} ${resource_type} ${resource_id}:`);
+        console.error('Error details:', error.message);
+
+        if (error.response) {
+            console.error('Response status:', error.response.status);
+            console.error('Response data:', error.response.data);
+        }
+
+        throw error;
+    }
+}
+
+// =============================================================================
+// REPLACE YOUR processSyncItemEnhanced FUNCTION WITH THIS
+// =============================================================================
+
+// Update your sync processing endpoint to use the fixed function
+app.post('/api/sync/process/fixed', async (req, res) => {
+    try {
+        const isOnline = await isMainServerOnline();
+        if (!isOnline) {
+            return res.status(503).json({ error: 'Asana server unavailable' });
+        }
+
+        const settings = await getSyncSettings();
+        const batchSize = parseInt(req.query.batch_size) || settings.batchSize;
+
+        const [queueItems] = await pool.execute(`
+            SELECT * FROM sync_queue 
+            WHERE status = 'pending' AND retry_count < 3
+            ORDER BY 
+                CASE operation_type 
+                    WHEN 'CREATE' THEN 1 
+                    WHEN 'UPDATE' THEN 2 
+                    WHEN 'DELETE' THEN 3 
+                END,
+                priority DESC, 
+                created_at ASC
+            LIMIT ${batchSize}
+        `);
+
+        let processed = 0;
+        let failed = 0;
+        let skipped = 0;
+        const results = [];
+
+        console.log(`🔄 Processing ${queueItems.length} sync items...`);
+
+        for (const item of queueItems) {
+            try {
+                await pool.execute('UPDATE sync_queue SET status = ? WHERE id = ?', ['processing', item.id]);
+
+                const result = await processSyncItemEnhancedFixed(item);
+
+                if (result.skipped) {
+                    await pool.execute(
+                        'UPDATE sync_queue SET status = ?, error_message = ? WHERE id = ?',
+                        ['completed', result.error, item.id]
+                    );
+                    skipped++;
+                } else {
+                    await pool.execute('UPDATE sync_queue SET status = ? WHERE id = ?', ['completed', item.id]);
+                    processed++;
+                }
+
+                results.push({
+                    id: item.id,
+                    resource_id: item.resource_id,
+                    status: result.skipped ? 'skipped' : 'completed',
+                    old_gid: result.oldGid,
+                    new_gid: result.newGid
+                });
+
+            } catch (error) {
+                failed++;
+                console.error(`❌ Failed to process item ${item.id}:`, error.message);
+
+                await pool.execute(
+                    'UPDATE sync_queue SET status = ?, retry_count = retry_count + 1, error_message = ? WHERE id = ?',
+                    ['failed', error.message.substring(0, 500), item.id]
+                );
+
+                results.push({
+                    id: item.id,
+                    resource_id: item.resource_id,
+                    status: 'failed',
+                    error: error.message
+                });
+            }
+        }
+
+        console.log(`🎉 Sync completed: ${processed} processed, ${failed} failed, ${skipped} skipped`);
+
+        res.json({
+            message: 'Sync processing completed',
+            processed,
+            failed,
+            skipped,
+            total: queueItems.length,
+            results
+        });
+
+    } catch (error) {
+        console.error('❌ Sync processing failed:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+console.log('🔧 UPDATE and DELETE endpoints added successfully!');
+
+// TEST UPDATE AND DELETE OPERATIONS
+// Add this test endpoint to your local-server.js
+
+app.get('/api/test/operations', async (req, res) => {
+    try {
+        console.log('🧪 Testing UPDATE and DELETE operations...');
+
+        // Test 1: Check available endpoints
+        const availableEndpoints = [
+            'PUT /api/tasks/:taskId',
+            'DELETE /api/tasks/:taskId',
+            'PUT /api/projects/:projectId',
+            'DELETE /api/projects/:projectId',
+            'POST /api/sync/process/fixed'
+        ];
+
+        // Test 2: Check sync queue for UPDATE/DELETE items
+        const [syncQueue] = await pool.execute(`
+            SELECT 
+                operation_type,
+                resource_type,
+                COUNT(*) as count,
+                status
+            FROM sync_queue 
+            WHERE operation_type IN ('UPDATE', 'DELETE')
+            GROUP BY operation_type, resource_type, status
+        `);
+
+        // Test 3: Check for tasks and projects that can be updated
+        const [testTasks] = await pool.execute(`
+            SELECT gid, name, sync_status 
+            FROM tasks 
+            WHERE gid NOT LIKE 'local_%' 
+            LIMIT 3
+        `);
+
+        const [testProjects] = await pool.execute(`
+            SELECT gid, name, sync_status 
+            FROM projects 
+            WHERE gid NOT LIKE 'local_%' 
+            LIMIT 3
+        `);
+
+        // Test 4: Check main server connectivity
+        const mainServerOnline = await isMainServerOnline();
+
+        res.json({
+            message: 'UPDATE/DELETE Operations Test',
+            endpoints_added: availableEndpoints,
+            main_server_online: mainServerOnline,
+            sync_queue_operations: syncQueue,
+            test_candidates: {
+                updatable_tasks: testTasks,
+                updatable_projects: testProjects
+            },
+            test_instructions: {
+                update_task: 'PUT /api/tasks/{task_gid} with JSON body: {"name": "Updated Task Name"}',
+                delete_task: 'DELETE /api/tasks/{task_gid}',
+                update_project: 'PUT /api/projects/{project_gid} with JSON body: {"name": "Updated Project Name"}',
+                delete_project: 'DELETE /api/projects/{project_gid}',
+                process_sync: 'POST /api/sync/process/fixed'
+            },
+            troubleshooting: mainServerOnline ? [
+                '✅ Main server is online - operations should sync',
+                '1. Test local update/delete operations first',
+                '2. Check sync_queue table for new entries',
+                '3. Run POST /api/sync/process/fixed to sync with Asana'
+            ] : [
+                '⚠️ Main server is offline - operations will queue for later',
+                '1. Test local update/delete operations (should work)',
+                '2. Check sync_queue table for new entries',
+                '3. Sync will happen when main server comes online'
+            ]
+        });
+
+    } catch (error) {
+        console.error('❌ Test operations failed:', error);
+        res.status(500).json({
+            error: error.message,
+            message: 'Could not complete operations test'
+        });
+    }
+});
+
+// Quick fix to replace the processSyncItemEnhanced function reference
+// Add this to the top of your sync processing section:
+
+// REPLACE the existing processSyncItemEnhanced calls with processSyncItemEnhancedFixed
+// Update your existing sync processing endpoint:
+
+app.post('/api/sync/process', async (req, res) => {
+    try {
+        const isOnline = await isMainServerOnline();
+        if (!isOnline) {
+            return res.status(503).json({ error: 'Asana server unavailable - cannot sync' });
+        }
+
+        const settings = await getSyncSettings();
+        const batchSize = parseInt(req.query.batch_size) || settings.batchSize;
+
+        console.log(`🔍 Getting pending sync items (batch size: ${batchSize})...`);
+
+        const [queueItems] = await pool.execute(`
+            SELECT * FROM sync_queue 
+            WHERE status = 'pending' AND retry_count < 3
+            ORDER BY 
+                CASE operation_type 
+                    WHEN 'CREATE' THEN 1 
+                    WHEN 'UPDATE' THEN 2 
+                    WHEN 'DELETE' THEN 3 
+                    ELSE 4 
+                END,
+                CASE resource_type 
+                    WHEN 'project' THEN 1 
+                    WHEN 'task' THEN 2 
+                    ELSE 3 
+                END,
+                priority DESC, 
+                created_at ASC
+            LIMIT ${batchSize}
+        `);
+
+        let processed = 0;
+        let failed = 0;
+        let skipped = 0;
+        const results = [];
+
+        console.log(`🔄 Found ${queueItems.length} items to sync...`);
+
+        if (queueItems.length === 0) {
+            return res.json({
+                message: 'No items to sync',
+                processed: 0,
+                failed: 0,
+                skipped: 0,
+                total: 0
+            });
+        }
+
+        for (const item of queueItems) {
+            const itemResult = {
+                id: item.id,
+                resource_id: item.resource_id,
+                operation_type: item.operation_type,
+                resource_type: item.resource_type
+            };
+
+            try {
+                console.log(`📝 Processing: ${item.operation_type} ${item.resource_type} ${item.resource_id}`);
+
+                // Mark as processing
+                await pool.execute('UPDATE sync_queue SET status = ? WHERE id = ?', ['processing', item.id]);
+
+                // Use the FIXED processing function
+                const result = await processSyncItemEnhancedFixed(item);
+
+                if (result.skipped) {
+                    await pool.execute(
+                        'UPDATE sync_queue SET status = ?, error_message = ? WHERE id = ?',
+                        ['completed', result.error || 'Operation skipped', item.id]
+                    );
+                    skipped++;
+                    itemResult.status = 'skipped';
+                    itemResult.reason = result.error;
+                } else {
+                    await pool.execute('UPDATE sync_queue SET status = ? WHERE id = ?', ['completed', item.id]);
+                    processed++;
+                    itemResult.status = 'completed';
+                    if (result.newGid) {
+                        itemResult.old_gid = result.oldGid;
+                        itemResult.new_gid = result.newGid;
+                    }
+                }
+
+            } catch (error) {
+                failed++;
+                console.error(`❌ Failed to sync item ${item.id}:`, error.message);
+
+                await pool.execute(
+                    'UPDATE sync_queue SET status = ?, retry_count = retry_count + 1, error_message = ? WHERE id = ?',
+                    ['failed', error.message.substring(0, 500), item.id]
+                );
+
+                itemResult.status = 'failed';
+                itemResult.error = error.message;
+            }
+
+            results.push(itemResult);
+        }
+
+        console.log(`🎉 Sync batch completed: ${processed} processed, ${failed} failed, ${skipped} skipped`);
+
+        res.json({
+            message: 'Sync processing completed with FIXED function',
+            processed,
+            failed,
+            skipped,
+            total: queueItems.length,
+            batch_size: batchSize,
+            results
+        });
+
+    } catch (error) {
+        console.error('❌ Error processing sync queue:', error);
+        res.status(500).json({
+            error: error.message,
+            details: 'Check server logs for more information'
+        });
+    }
+});
+
+console.log('🧪 Test operations endpoint added: GET /api/test/operations');
 // Start the server
 startServer();
 
