@@ -1,4 +1,4 @@
-// context/AsanaContext.jsx - FIXED: Maintains page state during task updates
+// context/AsanaContext.jsx - Complete Fixed Local MySQL First + Sync Queue Integration
 import React, { createContext, useContext, useState, useEffect } from 'react';
 import api from '../services/api';
 
@@ -29,20 +29,6 @@ export const AsanaProvider = ({ children }) => {
     const [localDBAvailable, setLocalDBAvailable] = useState(false);
     const [syncStatus, setSyncStatus] = useState('idle');
     const [queueStats, setQueueStats] = useState({ pending: 0, failed: 0, completed: 0 });
-
-
-
-    // NEW: Track page state to prevent blank pages
-    const [isUpdating, setIsUpdating] = useState(false);
-    const [lastError, setLastError] = useState(null);
-
-    // Sync setting provider
-    const [cacheInfo, setCacheInfo] = useState({
-        projects: 0,
-        tasks: 0,
-        storageUsed: 0,
-        lastSync: null
-    });
 
     console.log('🚀 AsanaProvider starting - Local MySQL First + Sync Queue...');
 
@@ -200,8 +186,8 @@ export const AsanaProvider = ({ children }) => {
                 // 2. Queue for main server sync (happens automatically in local server)
                 console.log(`📤 Queued ${resourceType} ${resourceId} for main server sync`);
 
-                // 3. Update queue stats quietly (don't block UI)
-                setTimeout(() => updateQueueStats(), 100);
+                // 3. Update queue stats
+                await updateQueueStats();
 
                 return result;
             } else {
@@ -287,9 +273,9 @@ export const AsanaProvider = ({ children }) => {
     };
 
     // Enhanced: Load data with smart server selection
-    const loadProjects = async (workspaceId = null, silent = false) => {
+    const loadProjects = async (workspaceId = null) => {
         try {
-            if (!silent) setLoading(true);
+            setLoading(true);
             setError(null);
 
             let endpoint;
@@ -308,17 +294,15 @@ export const AsanaProvider = ({ children }) => {
             console.log(`✅ Loaded ${projects.length} projects`);
         } catch (err) {
             console.error('Error loading projects:', err);
-            if (!silent) {
-                setError(`Failed to load projects: ${err.message}`);
-            }
+            setError(`Failed to load projects: ${err.message}`);
         } finally {
-            if (!silent) setLoading(false);
+            setLoading(false);
         }
     };
 
-    const loadAllWorkspaceProjects = async (silent = false) => {
+    const loadAllWorkspaceProjects = async () => {
         try {
-            if (!silent) setLoading(true);
+            setLoading(true);
             setError(null);
 
             let allProjects = [];
@@ -341,11 +325,9 @@ export const AsanaProvider = ({ children }) => {
             setProjects(allProjects);
         } catch (err) {
             console.error('Error loading all workspace projects:', err);
-            if (!silent) {
-                setError(`Failed to load projects: ${err.message}`);
-            }
+            setError(`Failed to load projects: ${err.message}`);
         } finally {
-            if (!silent) setLoading(false);
+            setLoading(false);
         }
     };
 
@@ -386,29 +368,20 @@ export const AsanaProvider = ({ children }) => {
         }
     };
 
-    // FIXED: Load project tasks without disrupting page state
-    const loadProjectTasks = async (project, silent = false) => {
+    const loadProjectTasks = async (project) => {
         try {
-            if (!silent) setLoading(true);
+            setLoading(true);
 
             const tasksData = await makeRequest('GET', `/projects/${project.gid}/tasks`);
             const tasks = tasksData.data || [];
             setTasks(tasks);
+            setSelectedProject(project);
 
-            // Only update selected project if not doing a silent refresh
-            if (!silent) {
-                setSelectedProject(project);
-            }
-
-            console.log(`✅ Loaded ${tasks.length} tasks for project ${project.name}`);
+            console.log(`✅ Loaded ${tasks.length} tasks`);
         } catch (err) {
-            const errorMsg = `Failed to load tasks: ${err.message}`;
-            setLastError(errorMsg);
-            if (!silent) {
-                setError(errorMsg);
-            }
+            setError(`Failed to load tasks: ${err.message}`);
         } finally {
-            if (!silent) setLoading(false);
+            setLoading(false);
         }
     };
 
@@ -519,88 +492,22 @@ export const AsanaProvider = ({ children }) => {
 
     const createProject = async (projectData) => {
         try {
-            console.log('🏗️ Creating project locally first:', projectData);
-
             if (selectedWorkspace) {
                 projectData.workspace = selectedWorkspace.gid;
             }
 
-            // Generate temporary local ID for immediate UI update
-            const tempProjectId = `local_${Date.now()}`;
-            const tempProject = {
-                gid: tempProjectId,
-                name: projectData.name,
-                notes: projectData.notes || '',
-                color: projectData.color || null,
-                workspace: { gid: projectData.workspace },
-                public: projectData.public || false,
-                archived: projectData.archived || false,
-                created_at: new Date().toISOString(),
-                sync_status: 'pending'
-            };
+            // Use direct API call for creation (not cached)
+            await api.post('/projects', projectData);
 
-            // 1. Add to UI immediately (optimistic update)
-            setProjects(prevProjects => [tempProject, ...prevProjects]);
-
-            // 2. Try local MySQL first
-            if (localDBAvailable) {
-                try {
-                    const response = await fetch(`${LOCAL_SERVER_URL}/projects`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            ...projectData,
-                            gid: tempProjectId // Use temp ID for local storage
-                        })
-                    });
-
-                    if (response.ok) {
-                        console.log('✅ Project created in local MySQL and queued for sync');
-
-                        // Update project status to show it's syncing
-                        setProjects(prevProjects =>
-                            prevProjects.map(p =>
-                                p.gid === tempProjectId
-                                    ? { ...p, sync_status: 'syncing' }
-                                    : p
-                            )
-                        );
-
-                        // Update queue stats
-                        setTimeout(() => updateQueueStats(), 100);
-                        return true;
-                    }
-                } catch (localError) {
-                    console.warn('Local project creation failed, trying main server:', localError.message);
-                }
+            // Refresh projects list
+            if (selectedWorkspace) {
+                await loadProjects(selectedWorkspace.gid);
+            } else {
+                await loadAllWorkspaceProjects();
             }
 
-            // 3. Fallback to main server if local fails
-            try {
-                const result = await api.post('/projects', projectData);
-                const newProject = result.data;
-
-                // Replace temp project with real project from server
-                setProjects(prevProjects =>
-                    prevProjects.map(p =>
-                        p.gid === tempProjectId
-                            ? { ...newProject, sync_status: 'synced' }
-                            : p
-                    )
-                );
-
-                console.log('✅ Project created on main server');
-                return true;
-            } catch (serverError) {
-                // Remove failed project from UI
-                setProjects(prevProjects =>
-                    prevProjects.filter(p => p.gid !== tempProjectId)
-                );
-                throw serverError;
-            }
-
+            return true;
         } catch (error) {
-            console.error('❌ Project creation failed:', error);
             throw error;
         }
     };
@@ -610,11 +517,11 @@ export const AsanaProvider = ({ children }) => {
             // Update local DB first, then queue for sync
             await updateLocalAndQueue('PUT', 'project', projectId, projectData, 'high');
 
-            // Refresh projects list silently
+            // Refresh projects list
             if (selectedWorkspace) {
-                await loadProjects(selectedWorkspace.gid, true);
+                await loadProjects(selectedWorkspace.gid);
             } else {
-                await loadAllWorkspaceProjects(true);
+                await loadAllWorkspaceProjects();
             }
 
             return true;
@@ -643,160 +550,29 @@ export const AsanaProvider = ({ children }) => {
 
     const createTask = async (taskData) => {
         try {
-            console.log('📝 Creating task locally first:', taskData);
+            // Use direct API call for creation
+            await api.post('/tasks', taskData);
 
-            // Generate temporary local ID for immediate UI update
-            const tempTaskId = `local_${Date.now()}`;
-            const tempTask = {
-                gid: tempTaskId,
-                name: taskData.name,
-                notes: taskData.notes || '',
-                completed: false,
-                assignee: taskData.assignee ? { gid: taskData.assignee } : null,
-                due_on: taskData.due_on || null,
-                projects: Array.isArray(taskData.projects) ? taskData.projects.map(p => ({ gid: p })) : [{ gid: taskData.projects }],
-                custom_fields: [],
-                created_at: new Date().toISOString(),
-                sync_status: 'pending'
-            };
-
-            // Handle custom fields properly
-            if (taskData.custom_fields) {
-                tempTask.priority = taskData.custom_fields.priority || 'Medium';
-                tempTask.progress = taskData.custom_fields.progress || 'Not Started';
-
-                // Create custom fields array for UI
-                tempTask.custom_fields = [
-                    {
-                        gid: "1208011690719461",
-                        name: "Priority",
-                        type: "enum",
-                        enum_value: { name: tempTask.priority }
-                    },
-                    {
-                        gid: "1208011690719462",
-                        name: "Task Progress",
-                        type: "enum",
-                        enum_value: { name: tempTask.progress }
-                    }
-                ];
+            // Refresh tasks
+            if (selectedProject) {
+                await loadProjectTasks(selectedProject);
             }
-
-            // 1. Add to UI immediately (optimistic update)
-            setTasks(prevTasks => [tempTask, ...prevTasks]);
-
-            // 2. Try local MySQL first
-            if (localDBAvailable) {
-                try {
-                    // Clean data for local server
-                    const cleanTaskData = { ...taskData };
-
-                    // Extract custom fields for local storage
-                    if (cleanTaskData.custom_fields) {
-                        if (cleanTaskData.custom_fields.priority) {
-                            cleanTaskData.priority = cleanTaskData.custom_fields.priority;
-                        }
-                        if (cleanTaskData.custom_fields.progress) {
-                            cleanTaskData.progress = cleanTaskData.custom_fields.progress;
-                        }
-                        delete cleanTaskData.custom_fields;
-                    }
-
-                    const response = await fetch(`${LOCAL_SERVER_URL}/tasks`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            ...cleanTaskData,
-                            gid: tempTaskId // Use temp ID for local storage
-                        })
-                    });
-
-                    if (response.ok) {
-                        console.log('✅ Task created in local MySQL and queued for sync');
-
-                        // Update task status to show it's syncing
-                        setTasks(prevTasks =>
-                            prevTasks.map(t =>
-                                t.gid === tempTaskId
-                                    ? { ...t, sync_status: 'syncing' }
-                                    : t
-                            )
-                        );
-
-                        // Update queue stats
-                        setTimeout(() => updateQueueStats(), 100);
-                        return true;
-                    }
-                } catch (localError) {
-                    console.warn('Local task creation failed, trying main server:', localError.message);
-                }
-            }
-
-            // 3. Fallback to main server if local fails
-            try {
-                const result = await api.post('/tasks', taskData);
-                const newTask = result.data;
-
-                // Replace temp task with real task from server
-                setTasks(prevTasks =>
-                    prevTasks.map(t =>
-                        t.gid === tempTaskId
-                            ? { ...newTask, sync_status: 'synced' }
-                            : t
-                    )
-                );
-
-                console.log('✅ Task created on main server');
-                return true;
-            } catch (serverError) {
-                // Remove failed task from UI
-                setTasks(prevTasks =>
-                    prevTasks.filter(t => t.gid !== tempTaskId)
-                );
-                throw serverError;
-            }
-
+            return true;
         } catch (error) {
-            console.error('❌ Task creation failed:', error);
             throw error;
         }
     };
 
-    // COMPLETELY FIXED: Local-first task updates that maintain page state
+    // FIXED: Local-first task updates with proper payload handling
     const updateTask = async (taskId, taskData) => {
         try {
             console.log('📝 Updating task locally first:', taskId, taskData);
-            setIsUpdating(true);
-            setLastError(null);
 
-            // 1. Create optimistic update
-            const originalTasks = [...tasks];
-
-            // Apply optimistic update to UI
+            // 1. Update UI immediately (optimistic update)
             setTasks(prevTasks =>
-                prevTasks.map(task => {
-                    if (task.gid === taskId) {
-                        const updatedTask = { ...task, ...taskData };
-
-                        // Handle custom fields properly for UI
-                        if (taskData.custom_fields) {
-                            updatedTask.custom_fields = Array.isArray(task.custom_fields)
-                                ? task.custom_fields.map(field => {
-                                    if (field.name === 'Priority' && taskData.custom_fields.priority) {
-                                        return { ...field, enum_value: { name: taskData.custom_fields.priority } };
-                                    }
-                                    if (field.name === 'Task Progress' && taskData.custom_fields.progress) {
-                                        return { ...field, enum_value: { name: taskData.custom_fields.progress } };
-                                    }
-                                    return field;
-                                })
-                                : [];
-                        }
-
-                        return updatedTask;
-                    }
-                    return task;
-                })
+                prevTasks.map(task =>
+                    task.gid === taskId ? { ...task, ...taskData } : task
+                )
             );
 
             // 2. Clean the task data for local server
@@ -819,34 +595,15 @@ export const AsanaProvider = ({ children }) => {
             await updateLocalAndQueue('PUT', 'task', taskId, cleanTaskData, 'high');
 
             console.log('✅ Task updated locally and queued for sync');
-
-            // 4. Optional: Silently refresh task data in background to sync with server
-            if (selectedProject) {
-                setTimeout(async () => {
-                    try {
-                        await loadProjectTasks(selectedProject, true);
-                    } catch (refreshError) {
-                        console.warn('Background task refresh failed:', refreshError.message);
-                    }
-                }, 1000);
-            }
-
             return true;
         } catch (error) {
             console.error('❌ Task update failed:', error);
-            setLastError(`Task update failed: ${error.message}`);
 
-            // Revert optimistic update on error by refreshing from server
+            // Revert optimistic update on error
             if (selectedProject) {
-                try {
-                    await loadProjectTasks(selectedProject, true);
-                } catch (refreshError) {
-                    console.error('Failed to refresh tasks after error:', refreshError.message);
-                }
+                await loadProjectTasks(selectedProject);
             }
             throw error;
-        } finally {
-            setIsUpdating(false);
         }
     };
 
@@ -863,14 +620,14 @@ export const AsanaProvider = ({ children }) => {
         }
     };
 
-    // ENHANCED: Local-first task completion toggle that maintains page state
+    // ENHANCED: Local-first task completion toggle
     const toggleTaskComplete = async (task) => {
         try {
             console.log('🔄 Toggling task completion locally first:', task.gid);
 
             const newCompleted = !task.completed;
 
-            // 1. Update UI immediately (optimistic update)
+            // 1. Update UI immediately
             setTasks(prevTasks =>
                 prevTasks.map(t =>
                     t.gid === task.gid ? { ...t, completed: newCompleted } : t
@@ -896,81 +653,12 @@ export const AsanaProvider = ({ children }) => {
 
     // NEW: Quick task update functions for common operations
     const updateTaskPriority = async (taskId, priority) => {
-        return await updateTask(taskId, {
-            custom_fields: { priority }
-        });
+        return await updateTask(taskId, { priority });
     };
 
     const updateTaskProgress = async (taskId, progress) => {
-        return await updateTask(taskId, {
-            custom_fields: { progress }
-        });
+        return await updateTask(taskId, { progress });
     };
-
-    // NEW: Refresh current data without changing page state
-    const refreshCurrentData = async () => {
-        try {
-            if (selectedProject) {
-                await loadProjectTasks(selectedProject, true);
-            }
-            if (selectedWorkspace) {
-                await loadProjects(selectedWorkspace.gid, true);
-            }
-        } catch (error) {
-            console.warn('Background refresh failed:', error.message);
-        }
-    };
-
-    const clearLocalCache = async () => {
-        // Implementation to clear local cache
-        try {
-            // Clear your local database/cache
-            setCacheInfo({ projects: 0, tasks: 0, storageUsed: 0 });
-            setQueueStats({ pending: 0, failed: 0, completed: 0 });
-        } catch (error) {
-            console.error('Error clearing cache:', error);
-            throw error;
-        }
-    };
-
-    const updateCacheInfo = async () => {
-        // Implementation to update cache info
-        try {
-            // Get current cache statistics
-            const info = {
-                projects: projects.length,
-                tasks: tasks.length,
-                storageUsed: 0 // Calculate actual storage used
-            };
-            setCacheInfo(info);
-        } catch (error) {
-            console.error('Error updating cache info:', error);
-        }
-    };
-
-
-
-
-    const getSyncQueueStatus = () => {
-        return {
-            total: queueStats.pending + queueStats.failed,
-            pending: queueStats.pending,
-            failed: queueStats.failed,
-            retry: 3 // Add retry count if needed
-        };
-    };
-
-    const clearSyncQueue = async () => {
-        // Implementation to clear failed sync items
-        try {
-            setQueueStats(prev => ({ ...prev, failed: 0 }));
-        } catch (error) {
-            console.error('Error clearing sync queue:', error);
-            throw error;
-        }
-    };
-
-
 
     // Initialize local DB check
     useEffect(() => {
@@ -1026,12 +714,9 @@ export const AsanaProvider = ({ children }) => {
         localDBAvailable,
         syncStatus,
         queueStats,
-        isUpdating,
-        lastError,
         pullAllDataFromAsana,
         processSyncQueue,
         updateQueueStats,
-        refreshCurrentData,
 
         // Your original functions
         loadUserData,
@@ -1048,17 +733,6 @@ export const AsanaProvider = ({ children }) => {
         deleteTask,
         toggleTaskComplete,
         checkServerConnection,
-
-        //Add these to your context value:
-
-        // Sync settings
-        cacheInfo,
-        clearLocalCache,
-        updateCacheInfo,
-        getSyncQueueStatus,
-        clearSyncQueue,
-        // ... rest of your existing values
-
 
         // NEW: Enhanced task update functions
         updateTaskPriority,

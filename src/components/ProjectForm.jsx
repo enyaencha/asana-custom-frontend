@@ -13,7 +13,7 @@ const ProjectForm = ({ project, onSave, onCancel }) => {
 
     // Real Asana project colors
     const projectColors = [
-        { value: 'dark-pink', label: 'Dark Pink', color: '#e91e63' },
+        { value: 'dark-pink', label: 'Dark', color: '#e91e63' },
         { value: 'dark-green', label: 'Dark Green', color: '#00c875' },
         { value: 'dark-orange', label: 'Dark Orange', color: '#ff9500' },
         { value: 'dark-purple', label: 'Dark Purple', color: '#7b68ee' },

@@ -49,6 +49,12 @@ const Navigation = ({ currentView, onNavigate, currentTheme }) => {
             label: 'Settings',
             icon: '⚙️',
             description: 'Preferences'
+        },
+        {
+            id: 'settings',
+            label: 'Admin panel',
+            icon: '⚙️',
+            description: 'Sync Settings'
         }
     ];
 

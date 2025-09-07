@@ -14,7 +14,7 @@ const SyncSettings = () => {
 
     const [settings, setSettings] = useState({
         autoSync: true,
-        syncIntervalMinutes: 5,
+        syncIntervalMinutes: 6,
         retryAttempts: 3,
         batchSize: 10
     });
